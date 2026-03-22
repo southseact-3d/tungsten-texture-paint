@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stl-texture-painter"
+version = "0.1.0"
+description = "STL texture painter with 3MF export"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "moderngl",
+  "moderngl-window",
+  "numpy",
+  "trimesh",
+  "numpy-stl",
+  "dearpygui",
+  "Pillow",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.package-data]
+stl_painter = ["shaders/*.vert", "shaders/*.frag", "assets/*"]

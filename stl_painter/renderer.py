@@ -15,6 +15,16 @@ from .mesh_model import MeshModel
 logger = logging.getLogger(__name__)
 
 VIEWPORT_BG = np.array((237, 240, 245, 255), dtype=np.uint8)
+SOFTWARE_GL_MARKERS = (
+    "software",
+    "swiftshader",
+    "llvmpipe",
+    "softpipe",
+    "gdi generic",
+    "microsoft basic render",
+    "microsoft basic render driver",
+    "mesa",
+)
 
 
 @dataclass(slots=True)
@@ -29,20 +39,32 @@ def make_grid_snapshot(viewport_size: tuple[int, int]) -> RenderSnapshot:
     return RenderSnapshot(rgba=rgba, viewport_size=viewport_size)
 
 
+def probe_gpu_support() -> tuple[bool, str]:
+    try:
+        ctx = moderngl.create_standalone_context()
+        info = getattr(ctx, "info", {}) or {}
+        vendor = str(info.get("GL_VENDOR", "unknown")).strip()
+        renderer = str(info.get("GL_RENDERER", "unknown")).strip()
+        combined = f"{vendor} | {renderer}".strip()
+        lowered = combined.lower()
+        is_software = any(marker in lowered for marker in SOFTWARE_GL_MARKERS)
+        return (not is_software), combined
+    except Exception as exc:
+        return False, f"unavailable ({exc})"
+
+
 class MeshRenderer:
     def __init__(
         self,
         ctx: object | None,
         mesh_model: MeshModel,
         viewport_size: tuple[int, int],
-        prefer_gpu: bool = False,
+        prefer_gpu: bool | None = None,
     ) -> None:
         self.ctx = ctx
         self.mesh_model = mesh_model
         self.viewport_size = viewport_size
-        self.prefer_gpu = prefer_gpu or os.environ.get(
-            "STL_TEXTURE_PAINTER_ENABLE_GPU", ""
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.prefer_gpu = self._resolve_gpu_preference(prefer_gpu)
         self._last_render_key: tuple[tuple[int, int], bytes] | None = None
         self._last_pick_image: np.ndarray | None = None
         self._gpu_ready = False
@@ -58,17 +80,41 @@ class MeshRenderer:
         self._colour_tex: moderngl.Texture | None = None
         self._pick_tex: moderngl.Texture | None = None
         self._colour_vertices: np.ndarray | None = None
+        self._face_centers = self.mesh_model.vertices[self.mesh_model.faces].mean(axis=1).astype(
+            np.float32
+        )
+        scale_env = os.environ.get("STL_TEXTURE_PAINTER_SOFTWARE_SCALE", "").strip()
+        if scale_env:
+            self._software_scale = float(scale_env)
+        elif self.mesh_model.face_count > 50000:
+            self._software_scale = 0.65
+        elif self.mesh_model.face_count > 25000:
+            self._software_scale = 0.78
+        else:
+            self._software_scale = 0.9
         logger.info(
-            "Initializing renderer | viewport=%s | faces=%s | vertices=%s | prefer_gpu=%s",
+            "Initializing renderer | viewport=%s | faces=%s | vertices=%s | prefer_gpu=%s | software_scale=%.2f",
             viewport_size,
             mesh_model.face_count,
             mesh_model.vertex_count,
             self.prefer_gpu,
+            self._software_scale,
         )
         if self.prefer_gpu:
             self._init_gpu_renderer()
         else:
             logger.info("Renderer starting in software mode")
+
+    def _resolve_gpu_preference(self, prefer_gpu: bool | None) -> bool:
+        if prefer_gpu is not None:
+            return prefer_gpu
+        env_value = os.environ.get("STL_TEXTURE_PAINTER_ENABLE_GPU", "").strip().lower()
+        if env_value in {"1", "true", "yes", "on"}:
+            return True
+        if env_value in {"0", "false", "no", "off"}:
+            return False
+        # Default to auto-detect: try the GPU path first and fall back safely if it fails.
+        return True
 
     @staticmethod
     def create_grid_texture(width: int, height: int) -> np.ndarray:
@@ -88,6 +134,12 @@ class MeshRenderer:
         try:
             self.ctx = self.ctx or moderngl.create_standalone_context()
             assert isinstance(self.ctx, moderngl.Context)
+            if self._context_is_software(self.ctx):
+                logger.warning(
+                    "OpenGL context is software-rendered; using software renderer instead"
+                )
+                self._gpu_ready = False
+                return
             self._mesh_program = self.ctx.program(
                 vertex_shader=self._shader_source("mesh.vert"),
                 fragment_shader=self._shader_source("mesh.frag"),
@@ -150,6 +202,13 @@ class MeshRenderer:
             logger.exception(
                 "Falling back to software renderer because GPU setup failed"
             )
+
+    def _context_is_software(self, ctx: moderngl.Context) -> bool:
+        info = getattr(ctx, "info", {}) or {}
+        vendor = str(info.get("GL_VENDOR", "")).lower()
+        renderer = str(info.get("GL_RENDERER", "")).lower()
+        combined = f"{vendor} {renderer}"
+        return any(marker in combined for marker in SOFTWARE_GL_MARKERS)
 
     def _create_framebuffers(self) -> None:
         if not self._gpu_ready and not isinstance(self.ctx, moderngl.Context):
@@ -289,12 +348,23 @@ class MeshRenderer:
             return None
         return face_id
 
+    def _render_size(self) -> tuple[int, int]:
+        width, height = self.viewport_size
+        scale = min(max(self._software_scale, 0.35), 1.0)
+        if scale >= 0.999:
+            return width, height
+        return max(320, int(width * scale)), max(240, int(height * scale))
+
     def _project_faces(
-        self, camera: OrbitCamera
+        self,
+        camera: OrbitCamera,
+        screen_size: tuple[int, int],
+        *,
+        min_area: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         vertices = self.mesh_model.vertices
         faces = self.mesh_model.faces
-        width, height = self.viewport_size
+        width, height = screen_size
         mvp = camera.mvp_matrix(self.viewport_size)
         clip = (mvp @ np.c_[vertices, np.ones(len(vertices), dtype=np.float32)].T).T
         w = clip[:, 3:4]
@@ -306,16 +376,39 @@ class MeshRenderer:
         valid_faces = valid_vertices[faces].all(axis=1)
         valid_faces &= (np.abs(face_vertices[:, :, 2]) <= 1.5).any(axis=1)
 
+        to_camera = camera.position().astype(np.float32) - self._face_centers
+        facing = np.einsum("ij,ij->i", self.mesh_model.normals, to_camera) > 0.0
+        valid_faces &= facing
+
         screen = np.empty((len(vertices), 2), dtype=np.float32)
         screen[:, 0] = (ndc[:, 0] * 0.5 + 0.5) * width
         screen[:, 1] = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height
 
         projected = screen[faces]
+        mins = projected.min(axis=1)
+        maxs = projected.max(axis=1)
+        valid_faces &= maxs[:, 0] >= 0.0
+        valid_faces &= mins[:, 0] < float(width)
+        valid_faces &= maxs[:, 1] >= 0.0
+        valid_faces &= mins[:, 1] < float(height)
+        if min_area > 0.0:
+            edge_a = projected[:, 1] - projected[:, 0]
+            edge_b = projected[:, 2] - projected[:, 0]
+            double_area = np.abs(edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0])
+            valid_faces &= double_area >= (min_area * 2.0)
         depths = face_vertices[:, :, 2].mean(axis=1)
         return projected, depths, valid_faces
 
-    def _sorted_face_indices(self, camera: OrbitCamera) -> tuple[np.ndarray, np.ndarray]:
-        projected, depths, valid_faces = self._project_faces(camera)
+    def _sorted_face_indices(
+        self,
+        camera: OrbitCamera,
+        screen_size: tuple[int, int],
+        *,
+        min_area: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        projected, depths, valid_faces = self._project_faces(
+            camera, screen_size, min_area=min_area
+        )
         visible = np.where(valid_faces)[0]
         if len(visible) == 0:
             return projected, visible
@@ -327,12 +420,14 @@ class MeshRenderer:
         camera: OrbitCamera,
         light_dir: tuple[float, float, float] = (0.3, 0.8, 0.4),
     ) -> RenderSnapshot:
-        projected, order = self._sorted_face_indices(camera)
-        width, height = self.viewport_size
+        render_size = self._render_size()
+        projected, order = self._sorted_face_indices(camera, render_size, min_area=1.25)
+        width, height = render_size
         image = Image.new("RGBA", (width, height), tuple(int(v) for v in VIEWPORT_BG))
         draw = ImageDraw.Draw(image, "RGBA")
 
-        light = np.asarray(light_dir, dtype=np.float32)
+        view_light = camera.position() - camera.target
+        light = np.asarray(light_dir, dtype=np.float32) + view_light.astype(np.float32) * 0.12
         light_norm = max(float(np.linalg.norm(light)), 1e-6)
         light = light / light_norm
 
@@ -341,13 +436,16 @@ class MeshRenderer:
             normal = self.mesh_model.normals[face_id]
             normal_norm = max(float(np.linalg.norm(normal)), 1e-6)
             normal = normal / normal_norm
-            diffuse = max(float(np.dot(normal, light)), 0.22)
+            diffuse = max(float(np.dot(normal, light)), 0.0)
+            diffuse = 0.18 + diffuse * 0.82
             base = np.asarray(self.mesh_model.face_colour(int(face_id)), dtype=np.float32)
-            lit = np.clip(base[:3] * diffuse + 20.0, 0.0, 255.0).astype(np.uint8)
+            lit = np.clip(base[:3] * diffuse + 26.0, 0.0, 255.0).astype(np.uint8)
             draw.polygon(
                 points, fill=(int(lit[0]), int(lit[1]), int(lit[2]), int(base[3]))
             )
 
+        if render_size != self.viewport_size:
+            image = image.resize(self.viewport_size, Image.Resampling.BILINEAR)
         rgba = np.asarray(image, dtype=np.uint8)
         self._last_render_key = self._camera_key(camera)
         self._last_pick_image = None
@@ -359,7 +457,7 @@ class MeshRenderer:
         return RenderSnapshot(rgba=rgba, viewport_size=self.viewport_size)
 
     def _build_pick_image_software(self, camera: OrbitCamera) -> np.ndarray:
-        projected, order = self._sorted_face_indices(camera)
+        projected, order = self._sorted_face_indices(camera, self.viewport_size)
         width, height = self.viewport_size
         image = Image.new("RGB", (width, height), (0, 0, 0))
         draw = ImageDraw.Draw(image, "RGB")
@@ -376,7 +474,7 @@ class MeshRenderer:
         return pick_image
 
     def _point_hits_face_zero(self, camera: OrbitCamera, mouse_x: int, mouse_y: int) -> bool:
-        projected, order = self._sorted_face_indices(camera)
+        projected, order = self._sorted_face_indices(camera, self.viewport_size)
         if len(order) == 0 or int(order[-1]) != 0:
             return False
         triangle = projected[0]

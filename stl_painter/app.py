@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import logging
 from math import ceil
 from dataclasses import dataclass
@@ -19,10 +20,24 @@ from .logging_utils import log_file_path
 from .paint_tool import PaintTool
 from .picking import pick_face_cpu
 from .project_io import load_project, save_project
-from .renderer import MeshRenderer, RenderSnapshot, make_grid_snapshot
+from .renderer import MeshRenderer, RenderSnapshot, make_grid_snapshot, probe_gpu_support
 from .sketch_tool import SketchTool, bake_sketch_to_faces
 
 logger = logging.getLogger(__name__)
+_USER32 = ctypes.windll.user32
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
 
 ToolMode = Literal["paint", "fill", "sketch"]
 SketchPrimitive = Literal["text", "rect", "line", "freehand"]
@@ -82,10 +97,11 @@ class TexturePainterApp:
     def _create_ui(self) -> None:
         dpg.create_context()
         with dpg.texture_registry(show=False):
-            dpg.add_dynamic_texture(
+            dpg.add_raw_texture(
                 width=self.state.viewport_size[0],
                 height=self.state.viewport_size[1],
-                default_value=self._texture_data.flatten().tolist(),
+                default_value=self._texture_data,
+                format=dpg.mvFormat_Float_rgba,
                 tag="viewport_texture",
             )
 
@@ -370,6 +386,57 @@ class TexturePainterApp:
         pad_x, pad_y = dpg.get_item_rect_min("viewport_nav_pad")
         return mouse_x - pad_x, mouse_y - pad_y
 
+    def _global_mouse_position(self) -> tuple[float, float]:
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+        return float(mouse_x), float(mouse_y)
+
+    def _client_to_screen(self, x: float, y: float) -> tuple[float, float]:
+        hwnd = _USER32.GetActiveWindow()
+        if not hwnd:
+            return x, y
+        point = _POINT(int(round(x)), int(round(y)))
+        _USER32.ClientToScreen(hwnd, ctypes.byref(point))
+        return float(point.x), float(point.y)
+
+    def _nav_pad_screen_rect(self) -> tuple[int, int, int, int] | None:
+        if not dpg.does_item_exist("viewport_nav_pad"):
+            return None
+        local_x, local_y = dpg.get_item_rect_min("viewport_nav_pad")
+        width, height = dpg.get_item_rect_size("viewport_nav_pad")
+        screen_x, screen_y = self._client_to_screen(local_x, local_y)
+        inset = 12
+        left = int(round(screen_x + inset))
+        top = int(round(screen_y + inset))
+        right = int(round(screen_x + width - inset))
+        bottom = int(round(screen_y + height - inset))
+        return left, top, right, bottom
+
+    def _nav_pad_screen_center(self) -> tuple[float, float] | None:
+        rect = self._nav_pad_screen_rect()
+        if rect is None:
+            return None
+        left, top, right, bottom = rect
+        return (left + right) / 2.0, (top + bottom) / 2.0
+
+    def _clip_nav_cursor(self) -> None:
+        rect = self._nav_pad_screen_rect()
+        if rect is None:
+            return
+        left, top, right, bottom = rect
+        clip = _RECT(left=left, top=top, right=right, bottom=bottom)
+        _USER32.ClipCursor(ctypes.byref(clip))
+
+    def _center_nav_cursor(self) -> tuple[float, float] | None:
+        center = self._nav_pad_screen_center()
+        if center is None:
+            return None
+        x, y = center
+        _USER32.SetCursorPos(int(round(x)), int(round(y)))
+        return center
+
+    def _release_cursor_clip(self) -> None:
+        _USER32.ClipCursor(None)
+
     def _nav_axis_items(self) -> list[dict[str, object]]:
         if self.state.camera is None:
             return []
@@ -542,8 +609,14 @@ class TexturePainterApp:
             mesh_model.source_path,
         )
         try:
+            gpu_available, gpu_description = probe_gpu_support()
+            logger.info(
+                "Viewport GPU probe | available=%s | description=%s",
+                gpu_available,
+                gpu_description,
+            )
             camera = OrbitCamera.for_mesh(mesh_model.vertices)
-            renderer = MeshRenderer(None, mesh_model, viewport_size)
+            renderer = MeshRenderer(None, mesh_model, viewport_size, prefer_gpu=False)
         except Exception as exc:
             logger.exception("Failed to initialize renderer for loaded mesh")
             self._set_status(
@@ -602,7 +675,8 @@ class TexturePainterApp:
             alpha = overlay[:, :, 3:4]
             rgba = overlay[:, :, :4] * alpha + rgba * (1.0 - alpha)
             rgba[:, :, 3] = 1.0
-        dpg.set_value("viewport_texture", rgba.flatten().tolist())
+        self._texture_data[:, :, :] = rgba
+        dpg.set_value("viewport_texture", self._texture_data)
         self._position_nav_widget()
         self._draw_nav_pad()
         self.state.viewport_dirty = False
@@ -705,9 +779,12 @@ class TexturePainterApp:
                 action, axis = self._nav_hit_test(nav_pos)
                 if action != "none":
                     self.state.nav_dragging = True
-                    self.state.nav_drag_origin = nav_pos
                     self.state.nav_pressed_axis = axis
                     self.state.nav_drag_moved = False
+                    self._clip_nav_cursor()
+                    self.state.nav_drag_origin = self._center_nav_cursor()
+                    if self.state.nav_drag_origin is None:
+                        self.state.nav_drag_origin = self._global_mouse_position()
                 return
         if not self._mouse_inside_viewport():
             return
@@ -743,6 +820,7 @@ class TexturePainterApp:
             self.state.nav_drag_origin = None
             self.state.nav_pressed_axis = None
             self.state.nav_drag_moved = False
+            self._release_cursor_clip()
             return
         if not self.state.dragging or self.state.drag_origin is None:
             return
@@ -804,16 +882,15 @@ class TexturePainterApp:
             self.state.nav_hover_axis = None
             self._draw_nav_pad()
         if self.state.nav_dragging and self.state.camera and self.state.nav_drag_origin is not None:
-            mouse_pos = self._nav_pad_mouse_position()
-            if mouse_pos is None:
-                return
+            mouse_pos = self._global_mouse_position()
             dx = mouse_pos[0] - self.state.nav_drag_origin[0]
             dy = mouse_pos[1] - self.state.nav_drag_origin[1]
-            if dx * dx + dy * dy >= 4.0:
+            if dx * dx + dy * dy >= 1.0:
                 self.state.nav_drag_moved = True
             if self.state.nav_drag_moved:
-                self.state.camera.orbit(dx * 0.7, -dy * 0.7)
-            self.state.nav_drag_origin = mouse_pos
+                self.state.camera.orbit(dx * 2.4, -dy * 2.4)
+                new_origin = self._center_nav_cursor()
+                self.state.nav_drag_origin = new_origin or self.state.nav_drag_origin
             if self.state.nav_drag_moved:
                 self._mark_viewport_dirty()
             return
@@ -950,14 +1027,18 @@ class TexturePainterApp:
         self._set_status(f"Undo restored {len(touched)} face(s)")
 
     def run(self) -> None:
-        while dpg.is_dearpygui_running():
-            try:
-                self._render_viewport()
-            except Exception as exc:
-                logger.exception("Render loop failure")
-                self._set_status(f"Render error: {exc}")
-            dpg.render_dearpygui_frame()
-        dpg.destroy_context()
+        try:
+            while dpg.is_dearpygui_running():
+                try:
+                    self._render_viewport()
+                except Exception as exc:
+                    logger.exception("Render loop failure")
+                    self._set_status(f"Render error: {exc}")
+                dpg.render_dearpygui_frame()
+                self._position_nav_widget()
+        finally:
+            self._release_cursor_clip()
+            dpg.destroy_context()
 
 
 def export_demo_mesh(path: str | Path) -> None:

@@ -63,6 +63,8 @@ class AppState:
     nav_dragging: bool = False
     nav_drag_origin: tuple[float, float] | None = None
     nav_hover_axis: NavAxis | None = None
+    nav_pressed_axis: NavAxis | None = None
+    nav_drag_moved: bool = False
     freehand_points: list[tuple[float, float]] | None = None
     viewport_dirty: bool = True
 
@@ -255,14 +257,12 @@ class TexturePainterApp:
         else:
             self.state.camera = OrbitCamera(np.array([0.0, 0.0, 0.0], dtype=np.float32), 5.0)
         self._mark_viewport_dirty()
-        self._render_viewport()
 
     def _orbit_step(self, delta_azimuth: float, delta_elevation: float) -> None:
         if self.state.camera is None:
             return
         self.state.camera.orbit(delta_azimuth, delta_elevation)
         self._mark_viewport_dirty()
-        self._render_viewport()
 
     def _position_nav_widget(self) -> None:
         if not dpg.does_item_exist("viewport_nav") or not dpg.does_item_exist("viewport_image"):
@@ -420,6 +420,15 @@ class TexturePainterApp:
             return "orbit", None
         return "none", None
 
+    def _mouse_button_from_event(self, app_data: object) -> int | None:
+        if isinstance(app_data, int):
+            return app_data
+        if isinstance(app_data, (tuple, list)) and app_data:
+            first = app_data[0]
+            if isinstance(first, int):
+                return first
+        return None
+
     def _snap_camera_to_axis(self, axis: NavAxis) -> None:
         if self.state.camera is None:
             return
@@ -434,7 +443,6 @@ class TexturePainterApp:
         azimuth, elevation = targets[axis]
         self.state.camera.set_angles(azimuth, elevation)
         self._mark_viewport_dirty()
-        self._render_viewport()
 
     def _project_world_to_screen(
         self, camera: OrbitCamera, point: np.ndarray
@@ -549,7 +557,6 @@ class TexturePainterApp:
         self.state.sketch_tool = SketchTool(viewport_size)
         self.state.viewport_size = viewport_size
         self._mark_viewport_dirty()
-        self._render_viewport()
         self._set_status(
             f"Loaded mesh with {mesh_model.face_count} faces from {Path(mesh_model.source_path or 'project').name}"
         )
@@ -666,7 +673,6 @@ class TexturePainterApp:
             self.state.renderer.update_face_colour(touched_face)
         if touched:
             self._mark_viewport_dirty()
-            self._render_viewport()
             self._set_status(f"Painted {len(touched)} face(s)")
 
     def _apply_sketch_point(self, mouse_pos: tuple[float, float]) -> None:
@@ -690,25 +696,26 @@ class TexturePainterApp:
                 size,
             )
             self._mark_viewport_dirty()
-            self._render_viewport()
 
     def _on_mouse_down(self, sender: int, app_data: tuple[int, float]) -> None:
-        if self._nav_pad_hovered() and self.state.camera is not None and app_data[0] == 0:
+        button = self._mouse_button_from_event(app_data)
+        if self._nav_pad_hovered() and self.state.camera is not None and button == 0:
             nav_pos = self._nav_pad_mouse_position()
             if nav_pos is not None:
                 action, axis = self._nav_hit_test(nav_pos)
-                if action == "axis" and axis is not None:
-                    self._snap_camera_to_axis(axis)
-                elif action == "orbit":
+                if action != "none":
                     self.state.nav_dragging = True
                     self.state.nav_drag_origin = nav_pos
+                    self.state.nav_pressed_axis = axis
+                    self.state.nav_drag_moved = False
                 return
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
         if not self._mouse_within_frame(mouse_pos):
             return
-        button = app_data[0]
+        if button is None:
+            return
         self.state.dragging = True
         self.state.drag_button = button
         self.state.drag_origin = mouse_pos
@@ -723,15 +730,23 @@ class TexturePainterApp:
                 if face_id is not None:
                     self._apply_paint(face_id)
 
-    def _on_mouse_release(self, sender: int, app_data: tuple[int, float]) -> None:
+    def _on_mouse_release(self, sender: int, app_data: tuple[int, float] | int) -> None:
+        button = self._mouse_button_from_event(app_data)
         if self.state.nav_dragging:
+            if (
+                button == 0
+                and not self.state.nav_drag_moved
+                and self.state.nav_pressed_axis is not None
+            ):
+                self._snap_camera_to_axis(self.state.nav_pressed_axis)
             self.state.nav_dragging = False
             self.state.nav_drag_origin = None
+            self.state.nav_pressed_axis = None
+            self.state.nav_drag_moved = False
             return
         if not self.state.dragging or self.state.drag_origin is None:
             return
         mouse_pos = self._viewport_mouse_position()
-        button = app_data[0]
         if (
             button == 0
             and self.state.tool_mode == "sketch"
@@ -753,7 +768,6 @@ class TexturePainterApp:
                     width,
                 )
                 self._mark_viewport_dirty()
-                self._render_viewport()
             elif primitive == "line":
                 self.state.sketch_tool.add_line(
                     self.state.mesh_model,
@@ -763,7 +777,6 @@ class TexturePainterApp:
                     width,
                 )
                 self._mark_viewport_dirty()
-                self._render_viewport()
             elif primitive == "freehand" and self.state.freehand_points:
                 self.state.freehand_points.append(mouse_pos)
                 self.state.sketch_tool.add_freehand(
@@ -775,7 +788,6 @@ class TexturePainterApp:
                 )
                 self.state.freehand_points = None
                 self._mark_viewport_dirty()
-                self._render_viewport()
         self.state.dragging = False
         self.state.drag_button = None
         self.state.drag_origin = None
@@ -784,8 +796,10 @@ class TexturePainterApp:
         nav_pos = self._nav_pad_mouse_position() if self._nav_pad_hovered() else None
         if nav_pos is not None:
             action, axis = self._nav_hit_test(nav_pos)
-            self.state.nav_hover_axis = axis if action == "axis" else None
-            self._draw_nav_pad()
+            new_hover_axis = axis if action == "axis" else None
+            if new_hover_axis != self.state.nav_hover_axis:
+                self.state.nav_hover_axis = new_hover_axis
+                self._draw_nav_pad()
         elif self.state.nav_hover_axis is not None:
             self.state.nav_hover_axis = None
             self._draw_nav_pad()
@@ -795,10 +809,13 @@ class TexturePainterApp:
                 return
             dx = mouse_pos[0] - self.state.nav_drag_origin[0]
             dy = mouse_pos[1] - self.state.nav_drag_origin[1]
-            self.state.camera.orbit(dx * 0.6, -dy * 0.6)
+            if dx * dx + dy * dy >= 4.0:
+                self.state.nav_drag_moved = True
+            if self.state.nav_drag_moved:
+                self.state.camera.orbit(dx * 0.7, -dy * 0.7)
             self.state.nav_drag_origin = mouse_pos
-            self._mark_viewport_dirty()
-            self._render_viewport()
+            if self.state.nav_drag_moved:
+                self._mark_viewport_dirty()
             return
         if not self._mouse_inside_viewport():
             return
@@ -816,12 +833,10 @@ class TexturePainterApp:
                 self.state.camera.orbit(dx * 0.4, -dy * 0.4)
                 self.state.drag_origin = mouse_pos
                 self._mark_viewport_dirty()
-                self._render_viewport()
             elif self.state.drag_button == 2:
                 self.state.camera.pan(dx, dy)
                 self.state.drag_origin = mouse_pos
                 self._mark_viewport_dirty()
-                self._render_viewport()
             elif self.state.drag_button == 0 and self.state.tool_mode == "paint":
                 face_id = self._pick_face(mouse_pos)
                 if face_id is not None:
@@ -841,7 +856,6 @@ class TexturePainterApp:
             return
         self.state.camera.zoom(app_data * 0.1)
         self._mark_viewport_dirty()
-        self._render_viewport()
 
     def _on_key_down(self, sender: int, app_data: int) -> None:
         if app_data in (340, 344):
@@ -921,7 +935,6 @@ class TexturePainterApp:
             self.state.renderer.update_face_colour(face_id)
         self.state.sketch_tool.clear(self.state.mesh_model)
         self._mark_viewport_dirty()
-        self._render_viewport()
         self._set_status(f"Baked {len(baked)} face colours")
 
     def _on_undo(
@@ -934,7 +947,6 @@ class TexturePainterApp:
         for face_id in touched:
             self.state.renderer.update_face_colour(face_id)
         self._mark_viewport_dirty()
-        self._render_viewport()
         self._set_status(f"Undo restored {len(touched)} face(s)")
 
     def run(self) -> None:

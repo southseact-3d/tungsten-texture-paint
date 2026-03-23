@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -17,11 +18,22 @@ from .mesh_model import MeshModel
 from .paint_tool import PaintTool
 from .picking import pick_face_cpu
 from .project_io import load_project, save_project
-from .renderer import MeshRenderer, RenderSnapshot
+from .renderer import MeshRenderer, RenderSnapshot, make_grid_snapshot
 from .sketch_tool import SketchTool, bake_sketch_to_faces
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 ToolMode = Literal["paint", "fill", "sketch"]
 SketchPrimitive = Literal["text", "rect", "line", "freehand"]
+
+# Light and dark theme colors
+LIGHT_BG_COLOR = (0.95, 0.95, 0.95, 1.0)  # Light gray
+DARK_BG_COLOR = (0.08, 0.1, 0.12, 1.0)  # Original dark blue-gray
+CURRENT_BG_COLOR = LIGHT_BG_COLOR  # Default to light mode
 
 PALETTE: list[Color] = [
     (220, 220, 220, 255),
@@ -57,12 +69,33 @@ class TexturePainterApp:
     def __init__(self) -> None:
         self.state = AppState(sketch_tool=SketchTool((960, 720)))
         self._ctx: moderngl.Context | None = None
-        self._texture_data = np.zeros((self.state.viewport_size[1], self.state.viewport_size[0], 4), dtype=np.float32)
+        self._texture_data = np.zeros(
+            (self.state.viewport_size[1], self.state.viewport_size[0], 4),
+            dtype=np.float32,
+        )
         self._create_ui()
 
     def _create_context(self) -> moderngl.Context:
         if self._ctx is None:
-            self._ctx = moderngl.create_standalone_context()
+            last_error: Exception | None = None
+            # Try explicit Windows backend first; fall back to the default backend.
+            for backend in ("wgl", None):
+                try:
+                    if backend is None:
+                        self._ctx = moderngl.create_standalone_context()
+                    else:
+                        self._ctx = moderngl.create_standalone_context(backend=backend)
+                    logger.info("Created OpenGL context with backend=%s", backend or "default")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Failed to create OpenGL context with backend=%s: %s",
+                        backend or "default",
+                        exc,
+                    )
+            if self._ctx is None and last_error is not None:
+                raise RuntimeError(f"Unable to create OpenGL context: {last_error}")
         return self._ctx
 
     def _create_ui(self) -> None:
@@ -108,27 +141,43 @@ class TexturePainterApp:
 
         with dpg.window(label="STL Texture Painter", tag="main_window"):
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Open STL / Project", callback=lambda: dpg.show_item("open_dialog"))
-                dpg.add_button(label="Export 3MF", callback=lambda: dpg.show_item("export_dialog"))
-                dpg.add_button(label="Save Project", callback=lambda: dpg.show_item("save_project_dialog"))
+                dpg.add_button(
+                    label="Open STL / Project",
+                    callback=lambda: dpg.show_item("open_dialog"),
+                )
+                dpg.add_button(
+                    label="Export 3MF", callback=lambda: dpg.show_item("export_dialog")
+                )
+                dpg.add_button(
+                    label="Save Project",
+                    callback=lambda: dpg.show_item("save_project_dialog"),
+                )
                 dpg.add_button(label="Bake Sketch", callback=self._on_bake_sketch)
                 dpg.add_button(label="Undo", callback=self._on_undo)
                 dpg.add_text("", tag="status_text")
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=280, autosize_y=True):
                     dpg.add_text("Tools")
-                    dpg.add_radio_button(items=["paint", "fill", "sketch"], default_value="paint", callback=self._set_tool_mode)
+                    dpg.add_radio_button(
+                        items=["paint", "fill", "sketch"],
+                        default_value="paint",
+                        callback=self._set_tool_mode,
+                    )
                     dpg.add_separator()
                     dpg.add_text("Colour")
                     for index, colour in enumerate(PALETTE):
                         dpg.add_color_button(
-                            default_value=[component / 255.0 for component in colour],
+                            default_value=[int(c / 255.0 * 255) for c in colour],
                             width=40,
                             height=40,
-                            callback=lambda sender, app_data, user_data=index: self._select_palette_colour(user_data),
+                            callback=lambda sender, app_data, user_data=index: (
+                                self._select_palette_colour(user_data)
+                            ),
                         )
                     dpg.add_color_picker(
-                        default_value=[component / 255.0 for component in self.state.active_colour],
+                        default_value=[
+                            int(c / 255.0 * 255) for c in self.state.active_colour
+                        ],
                         alpha_bar=True,
                         display_rgb=True,
                         callback=self._on_custom_colour,
@@ -136,15 +185,35 @@ class TexturePainterApp:
                     )
                     dpg.add_separator()
                     dpg.add_text("Sketch")
-                    dpg.add_radio_button(items=["text", "rect", "line", "freehand"], default_value="text", callback=self._set_sketch_primitive)
-                    dpg.add_input_text(label="Text", default_value="Sample", tag="sketch_text_value")
-                    dpg.add_input_int(label="Text Size", default_value=28, min_value=8, min_clamped=True, tag="sketch_text_size")
-                    dpg.add_input_int(label="Stroke Width", default_value=4, min_value=1, min_clamped=True, tag="sketch_stroke_width")
+                    dpg.add_radio_button(
+                        items=["text", "rect", "line", "freehand"],
+                        default_value="text",
+                        callback=self._set_sketch_primitive,
+                    )
+                    dpg.add_input_text(
+                        label="Text", default_value="Sample", tag="sketch_text_value"
+                    )
+                    dpg.add_input_int(
+                        label="Text Size",
+                        default_value=28,
+                        min_value=8,
+                        min_clamped=True,
+                        tag="sketch_text_size",
+                    )
+                    dpg.add_input_int(
+                        label="Stroke Width",
+                        default_value=4,
+                        min_value=1,
+                        min_clamped=True,
+                        tag="sketch_stroke_width",
+                    )
                     dpg.add_text("Sketch usage:")
                     dpg.add_text("Text: click once")
                     dpg.add_text("Rect/Line: drag")
                     dpg.add_text("Freehand: drag")
-                with dpg.child_window(tag="viewport_panel", autosize_x=True, autosize_y=True):
+                with dpg.child_window(
+                    tag="viewport_panel", autosize_x=True, autosize_y=True
+                ):
                     dpg.add_image("viewport_texture", tag="viewport_image")
                     with dpg.handler_registry():
                         dpg.add_mouse_down_handler(callback=self._on_mouse_down)
@@ -156,15 +225,22 @@ class TexturePainterApp:
 
         dpg.create_viewport(title="STL Texture Painter", width=1440, height=920)
         dpg.setup_dearpygui()
+        # Set viewport clear color (light gray background for light mode)
+        dpg.set_viewport_clear_color([242, 242, 242, 255])
         dpg.show_viewport()
         dpg.set_primary_window("main_window", True)
 
     def _select_palette_colour(self, index: int) -> None:
         self.state.active_colour = PALETTE[index]
-        dpg.set_value("active_colour_picker", [component / 255.0 for component in self.state.active_colour])
+        dpg.set_value(
+            "active_colour_picker",
+            [int(c / 255.0 * 255) for c in self.state.active_colour],
+        )
 
     def _on_custom_colour(self, sender: int, app_data: list[float]) -> None:
-        self.state.active_colour = clamp_color(int(round(component * 255)) for component in app_data)
+        self.state.active_colour = clamp_color(
+            int(round(component * 255)) for component in app_data
+        )
 
     def _set_tool_mode(self, sender: int, app_data: str) -> None:
         self.state.tool_mode = app_data  # type: ignore[assignment]
@@ -178,8 +254,13 @@ class TexturePainterApp:
 
     def _load_mesh_model(self, mesh_model: MeshModel) -> None:
         viewport_size = self._viewport_size()
-        camera = OrbitCamera.for_mesh(mesh_model.vertices)
-        renderer = MeshRenderer(self._create_context(), mesh_model, viewport_size)
+        try:
+            camera = OrbitCamera.for_mesh(mesh_model.vertices)
+            renderer = MeshRenderer(self._create_context(), mesh_model, viewport_size)
+        except Exception as exc:
+            logger.exception("Failed to initialize renderer for loaded mesh")
+            self._set_status(f"Mesh loaded but renderer failed: {exc}")
+            return
         self.state.mesh_model = mesh_model
         self.state.camera = camera
         self.state.renderer = renderer
@@ -205,12 +286,22 @@ class TexturePainterApp:
         dpg.delete_item("viewport_texture")
         self._texture_data = np.zeros((size[1], size[0], 4), dtype=np.float32)
         with dpg.texture_registry(show=False):
-            dpg.add_dynamic_texture(size[0], size[1], self._texture_data.flatten().tolist(), tag="viewport_texture")
+            dpg.add_dynamic_texture(
+                size[0],
+                size[1],
+                self._texture_data.flatten().tolist(),
+                tag="viewport_texture",
+            )
         dpg.configure_item("viewport_image", texture_tag="viewport_texture")
 
     def _render_snapshot(self) -> RenderSnapshot | None:
-        if not self.state.mesh_model or not self.state.camera or not self.state.renderer:
-            return None
+        if (
+            not self.state.mesh_model
+            or not self.state.camera
+            or not self.state.renderer
+        ):
+            # Show a software grid when no model is loaded to avoid a black viewport.
+            return make_grid_snapshot(self._viewport_size())
         size = self._viewport_size()
         self._ensure_texture_size(size)
         return self.state.renderer.render(self.state.camera)
@@ -221,14 +312,17 @@ class TexturePainterApp:
             return
         rgba = snapshot.rgba.astype(np.float32) / 255.0
         if self.state.sketch_tool and self.state.sketch_tool.current:
-            overlay = np.asarray(self.state.sketch_tool.current.image, dtype=np.float32) / 255.0
+            overlay = (
+                np.asarray(self.state.sketch_tool.current.image, dtype=np.float32)
+                / 255.0
+            )
             alpha = overlay[:, :, 3:4]
             rgba = overlay[:, :, :4] * alpha + rgba * (1.0 - alpha)
             rgba[:, :, 3] = 1.0
         dpg.set_value("viewport_texture", rgba.flatten().tolist())
 
     def _mouse_inside_viewport(self) -> bool:
-        return dpg.is_item_hovered("viewport_image")
+        return bool(dpg.is_item_hovered("viewport_image"))
 
     def _viewport_mouse_position(self) -> tuple[float, float]:
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
@@ -238,10 +332,18 @@ class TexturePainterApp:
     def _pick_face(self, mouse_pos: tuple[float, float]) -> int | None:
         if not self.state.mesh_model or not self.state.camera:
             return None
-        face_id = pick_face_cpu(self.state.mesh_model, self.state.camera, mouse_pos[0], mouse_pos[1], self.state.viewport_size)
+        face_id = pick_face_cpu(
+            self.state.mesh_model,
+            self.state.camera,
+            mouse_pos[0],
+            mouse_pos[1],
+            self.state.viewport_size,
+        )
         if face_id is None and self.state.renderer:
             try:
-                face_id = self.state.renderer.pick_face(self.state.camera, int(mouse_pos[0]), int(mouse_pos[1]))
+                face_id = self.state.renderer.pick_face(
+                    self.state.camera, int(mouse_pos[0]), int(mouse_pos[1])
+                )
             except Exception:
                 face_id = None
         self.state.hovered_face = face_id
@@ -250,10 +352,16 @@ class TexturePainterApp:
     def _apply_paint(self, face_id: int) -> None:
         if not self.state.paint_tool or not self.state.renderer:
             return
-        if self.state.tool_mode == "fill" or (self.state.tool_mode == "paint" and self.state.shift_down):
-            touched = self.state.paint_tool.flood_fill(face_id, self.state.active_colour)
+        if self.state.tool_mode == "fill" or (
+            self.state.tool_mode == "paint" and self.state.shift_down
+        ):
+            touched = self.state.paint_tool.flood_fill(
+                face_id, self.state.active_colour
+            )
         else:
-            touched = self.state.paint_tool.paint_face(face_id, self.state.active_colour)
+            touched = self.state.paint_tool.paint_face(
+                face_id, self.state.active_colour
+            )
         for touched_face in touched:
             self.state.renderer.update_face_colour(touched_face)
         if touched:
@@ -261,14 +369,25 @@ class TexturePainterApp:
             self._set_status(f"Painted {len(touched)} face(s)")
 
     def _apply_sketch_point(self, mouse_pos: tuple[float, float]) -> None:
-        if not self.state.mesh_model or not self.state.camera or not self.state.sketch_tool:
+        if (
+            not self.state.mesh_model
+            or not self.state.camera
+            or not self.state.sketch_tool
+        ):
             return
         primitive = self.state.sketch_primitive
         width = int(dpg.get_value("sketch_stroke_width"))
         if primitive == "text":
             text = str(dpg.get_value("sketch_text_value"))
             size = int(dpg.get_value("sketch_text_size"))
-            self.state.sketch_tool.add_text(self.state.mesh_model, self.state.camera, mouse_pos, text, self.state.active_colour, size)
+            self.state.sketch_tool.add_text(
+                self.state.mesh_model,
+                self.state.camera,
+                mouse_pos,
+                text,
+                self.state.active_colour,
+                size,
+            )
             self._render_viewport()
 
     def _on_mouse_down(self, sender: int, app_data: tuple[int, float]) -> None:
@@ -295,20 +414,45 @@ class TexturePainterApp:
             return
         mouse_pos = self._viewport_mouse_position()
         button = app_data[0]
-        if button == 0 and self.state.tool_mode == "sketch" and self.state.mesh_model and self.state.camera and self.state.sketch_tool:
+        if (
+            button == 0
+            and self.state.tool_mode == "sketch"
+            and self.state.mesh_model
+            and self.state.camera
+            and self.state.sketch_tool
+        ):
             primitive = self.state.sketch_primitive
             width = int(dpg.get_value("sketch_stroke_width"))
             if primitive == "rect":
                 x0, y0 = self.state.drag_origin
                 x1, y1 = mouse_pos
-                self.state.sketch_tool.add_rectangle(self.state.mesh_model, self.state.camera, (x0, y0, x1, y1), self.state.active_colour, None, width)
+                self.state.sketch_tool.add_rectangle(
+                    self.state.mesh_model,
+                    self.state.camera,
+                    (x0, y0, x1, y1),
+                    self.state.active_colour,
+                    None,
+                    width,
+                )
                 self._render_viewport()
             elif primitive == "line":
-                self.state.sketch_tool.add_line(self.state.mesh_model, self.state.camera, [self.state.drag_origin, mouse_pos], self.state.active_colour, width)
+                self.state.sketch_tool.add_line(
+                    self.state.mesh_model,
+                    self.state.camera,
+                    [self.state.drag_origin, mouse_pos],
+                    self.state.active_colour,
+                    width,
+                )
                 self._render_viewport()
             elif primitive == "freehand" and self.state.freehand_points:
                 self.state.freehand_points.append(mouse_pos)
-                self.state.sketch_tool.add_freehand(self.state.mesh_model, self.state.camera, self.state.freehand_points, self.state.active_colour, width)
+                self.state.sketch_tool.add_freehand(
+                    self.state.mesh_model,
+                    self.state.camera,
+                    self.state.freehand_points,
+                    self.state.active_colour,
+                    width,
+                )
                 self.state.freehand_points = None
                 self._render_viewport()
         self.state.dragging = False
@@ -319,7 +463,11 @@ class TexturePainterApp:
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
-        if self.state.dragging and self.state.camera and self.state.drag_origin is not None:
+        if (
+            self.state.dragging
+            and self.state.camera
+            and self.state.drag_origin is not None
+        ):
             dx = mouse_pos[0] - self.state.drag_origin[0]
             dy = mouse_pos[1] - self.state.drag_origin[1]
             if self.state.drag_button == 1:
@@ -334,13 +482,19 @@ class TexturePainterApp:
                 face_id = self._pick_face(mouse_pos)
                 if face_id is not None:
                     self._apply_paint(face_id)
-            elif self.state.drag_button == 0 and self.state.tool_mode == "sketch" and self.state.sketch_primitive == "freehand":
+            elif (
+                self.state.drag_button == 0
+                and self.state.tool_mode == "sketch"
+                and self.state.sketch_primitive == "freehand"
+            ):
                 if self.state.freehand_points is not None:
                     self.state.freehand_points.append(mouse_pos)
         else:
             face_id = self._pick_face(mouse_pos)
             if face_id is not None:
-                self._set_status(f"Hovered face: {face_id} | Mode: {self.state.tool_mode}")
+                self._set_status(
+                    f"Hovered face: {face_id} | Mode: {self.state.tool_mode}"
+                )
 
     def _on_mouse_wheel(self, sender: int, app_data: float) -> None:
         if not self.state.camera or not self._mouse_inside_viewport():
@@ -363,22 +517,42 @@ class TexturePainterApp:
             self.state.ctrl_down = False
 
     def _on_open_selected(self, sender: int, app_data: dict[str, object]) -> None:
-        path = str(app_data["file_path_name"])
-        suffix = Path(path).suffix.lower()
-        mesh_model = load_project(path) if suffix == ".json" else load_stl(path)
-        self._load_mesh_model(mesh_model)
+        try:
+            path = str(app_data["file_path_name"])
+            suffix = Path(path).suffix.lower()
+            mesh_model = load_project(path) if suffix == ".json" else load_stl(path)
+            self._load_mesh_model(mesh_model)
+        except Exception as exc:
+            logger.exception("Failed to open file")
+            self._set_status(f"Open failed: {exc}")
 
     def _on_export_selected(self, sender: int, app_data: dict[str, object]) -> None:
         if not self.state.mesh_model:
             self._set_status("No mesh loaded")
             return
         path = str(app_data["file_path_name"])
-        sketch_image = self.state.sketch_tool.current.image if self.state.sketch_tool and self.state.sketch_tool.current else None
-        view_projection = self.state.sketch_tool.current.view_projection if self.state.sketch_tool and self.state.sketch_tool.current else None
-        issues = export_3mf(path, self.state.mesh_model, sketch_image, view_projection, self.state.viewport_size if sketch_image is not None else None)
+        sketch_image = (
+            self.state.sketch_tool.current.image
+            if self.state.sketch_tool and self.state.sketch_tool.current
+            else None
+        )
+        view_projection = (
+            self.state.sketch_tool.current.view_projection
+            if self.state.sketch_tool and self.state.sketch_tool.current
+            else None
+        )
+        issues = export_3mf(
+            path,
+            self.state.mesh_model,
+            sketch_image,
+            view_projection,
+            self.state.viewport_size if sketch_image is not None else None,
+        )
         self._set_status("Exported 3MF | " + " ".join(issues))
 
-    def _on_save_project_selected(self, sender: int, app_data: dict[str, object]) -> None:
+    def _on_save_project_selected(
+        self, sender: int, app_data: dict[str, object]
+    ) -> None:
         if not self.state.mesh_model:
             self._set_status("No mesh loaded")
             return
@@ -386,7 +560,12 @@ class TexturePainterApp:
         self._set_status("Saved project JSON")
 
     def _on_bake_sketch(self) -> None:
-        if not self.state.mesh_model or not self.state.renderer or not self.state.sketch_tool or not self.state.sketch_tool.current:
+        if (
+            not self.state.mesh_model
+            or not self.state.renderer
+            or not self.state.sketch_tool
+            or not self.state.sketch_tool.current
+        ):
             self._set_status("No sketch to bake")
             return
         baked = bake_sketch_to_faces(
@@ -402,7 +581,9 @@ class TexturePainterApp:
         self._render_viewport()
         self._set_status(f"Baked {len(baked)} face colours")
 
-    def _on_undo(self, sender: int | None = None, app_data: object | None = None) -> None:
+    def _on_undo(
+        self, sender: int | None = None, app_data: object | None = None
+    ) -> None:
         if not self.state.paint_tool or not self.state.renderer:
             self._set_status("Nothing to undo")
             return
@@ -416,8 +597,9 @@ class TexturePainterApp:
         while dpg.is_dearpygui_running():
             try:
                 self._render_viewport()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.exception("Render loop failure")
+                self._set_status(f"Render error: {exc}")
             dpg.render_dearpygui_frame()
         dpg.destroy_context()
 

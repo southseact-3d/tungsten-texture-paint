@@ -1,0 +1,26 @@
+# Python cache and virtual envs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+*.spec.bak
+
+# Logs and local scratch files
+*.log
+nul
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

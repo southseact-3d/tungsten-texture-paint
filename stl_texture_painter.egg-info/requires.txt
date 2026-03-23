@@ -1,7 +1,0 @@
-moderngl
-moderngl-window
-numpy
-trimesh
-numpy-stl
-dearpygui
-Pillow

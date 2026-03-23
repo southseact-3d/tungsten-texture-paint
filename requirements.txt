@@ -5,4 +5,3 @@ trimesh
 numpy-stl
 dearpygui
 Pillow
-pytest

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from math import ceil
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -68,6 +69,7 @@ class AppState:
 class TexturePainterApp:
     def __init__(self) -> None:
         self.state = AppState(sketch_tool=SketchTool((960, 720)))
+        self.state.camera = OrbitCamera(np.array([0.0, 0.0, 0.0], dtype=np.float32), 5.0)
         self._ctx: moderngl.Context | None = None
         self._texture_data = np.zeros(
             (self.state.viewport_size[1], self.state.viewport_size[0], 4),
@@ -215,6 +217,24 @@ class TexturePainterApp:
                     tag="viewport_panel", autosize_x=True, autosize_y=True
                 ):
                     dpg.add_image("viewport_texture", tag="viewport_image")
+                    with dpg.window(
+                        tag="viewport_nav",
+                        label="",
+                        no_title_bar=True,
+                        no_move=True,
+                        no_resize=True,
+                        no_scrollbar=True,
+                        no_collapse=True,
+                        autosize=True,
+                    ):
+                        dpg.add_text("View")
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="L", width=34, callback=lambda: self._orbit_step(-12.0, 0.0))
+                            dpg.add_button(label="R", width=34, callback=lambda: self._orbit_step(12.0, 0.0))
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="U", width=34, callback=lambda: self._orbit_step(0.0, -10.0))
+                            dpg.add_button(label="D", width=34, callback=lambda: self._orbit_step(0.0, 10.0))
+                        dpg.add_button(label="Home", width=72, callback=self._reset_view)
                     with dpg.handler_registry():
                         dpg.add_mouse_down_handler(callback=self._on_mouse_down)
                         dpg.add_mouse_release_handler(callback=self._on_mouse_release)
@@ -251,6 +271,120 @@ class TexturePainterApp:
 
     def _set_status(self, text: str) -> None:
         dpg.set_value("status_text", text)
+
+    def _reset_view(self) -> None:
+        if self.state.mesh_model is not None:
+            self.state.camera = OrbitCamera.for_mesh(self.state.mesh_model.vertices)
+        else:
+            self.state.camera = OrbitCamera(np.array([0.0, 0.0, 0.0], dtype=np.float32), 5.0)
+        self._render_viewport()
+
+    def _orbit_step(self, delta_azimuth: float, delta_elevation: float) -> None:
+        if self.state.camera is None:
+            return
+        self.state.camera.orbit(delta_azimuth, delta_elevation)
+        self._render_viewport()
+
+    def _position_nav_widget(self) -> None:
+        if not dpg.does_item_exist("viewport_nav") or not dpg.does_item_exist("viewport_image"):
+            return
+        image_pos = dpg.get_item_rect_min("viewport_image")
+        image_size = dpg.get_item_rect_size("viewport_image")
+        nav_size = dpg.get_item_rect_size("viewport_nav")
+        if image_size[0] <= 0 or image_size[1] <= 0:
+            return
+        x = int(image_pos[0] + image_size[0] - nav_size[0] - 12)
+        y = int(image_pos[1] + 12)
+        dpg.set_item_pos("viewport_nav", [x, y])
+
+    def _project_world_to_screen(
+        self, camera: OrbitCamera, point: np.ndarray
+    ) -> tuple[int, int] | None:
+        mvp = camera.mvp_matrix(self.state.viewport_size)
+        clip = mvp @ np.array([point[0], point[1], point[2], 1.0], dtype=np.float32)
+        w = float(clip[3])
+        if abs(w) < 1e-6:
+            return None
+        ndc = clip[:3] / w
+        if ndc[2] < -1.2 or ndc[2] > 1.2:
+            return None
+        width, height = self.state.viewport_size
+        sx = int((ndc[0] * 0.5 + 0.5) * width)
+        sy = int((1.0 - (ndc[1] * 0.5 + 0.5)) * height)
+        return sx, sy
+
+    def _draw_line_on_rgba(
+        self,
+        rgba: np.ndarray,
+        p0: tuple[int, int],
+        p1: tuple[int, int],
+        colour: tuple[float, float, float],
+        alpha: float,
+    ) -> None:
+        x0, y0 = p0
+        x1, y1 = p1
+        dx = x1 - x0
+        dy = y1 - y0
+        steps = max(abs(dx), abs(dy), 1)
+        xs = np.linspace(x0, x1, steps + 1, dtype=np.int32)
+        ys = np.linspace(y0, y1, steps + 1, dtype=np.int32)
+        h, w, _ = rgba.shape
+        mask = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if not np.any(mask):
+            return
+        xs = xs[mask]
+        ys = ys[mask]
+        rgb = np.array(colour, dtype=np.float32)
+        rgba[ys, xs, :3] = rgba[ys, xs, :3] * (1.0 - alpha) + rgb * alpha
+        rgba[ys, xs, 3] = 1.0
+
+    def _draw_world_grid(self, rgba: np.ndarray) -> None:
+        if self.state.camera is None:
+            return
+        camera = self.state.camera
+        width, _ = self.state.viewport_size
+        if self.state.mesh_model is not None:
+            mins = self.state.mesh_model.vertices.min(axis=0)
+            maxs = self.state.mesh_model.vertices.max(axis=0)
+            extent = float(np.linalg.norm(maxs - mins))
+            size = max(2.0, extent * 1.2)
+        else:
+            size = 4.0
+        major_lines = 8
+        step = max(size / major_lines, 0.25)
+        line_count = int(ceil(size / step))
+
+        # XZ-plane grid at y=0, Blender-style world floor.
+        for i in range(-line_count, line_count + 1):
+            v = i * step
+            p0 = self._project_world_to_screen(camera, np.array([-size, 0.0, v], dtype=np.float32))
+            p1 = self._project_world_to_screen(camera, np.array([size, 0.0, v], dtype=np.float32))
+            p2 = self._project_world_to_screen(camera, np.array([v, 0.0, -size], dtype=np.float32))
+            p3 = self._project_world_to_screen(camera, np.array([v, 0.0, size], dtype=np.float32))
+            if p0 and p1:
+                strength = 0.32 if i % 5 == 0 else 0.16
+                self._draw_line_on_rgba(rgba, p0, p1, (0.30, 0.34, 0.38), strength)
+            if p2 and p3:
+                strength = 0.32 if i % 5 == 0 else 0.16
+                self._draw_line_on_rgba(rgba, p2, p3, (0.30, 0.34, 0.38), strength)
+
+        # Axis tint like DCC viewports.
+        ax0 = self._project_world_to_screen(camera, np.array([-size, 0.0, 0.0], dtype=np.float32))
+        ax1 = self._project_world_to_screen(camera, np.array([size, 0.0, 0.0], dtype=np.float32))
+        az0 = self._project_world_to_screen(camera, np.array([0.0, 0.0, -size], dtype=np.float32))
+        az1 = self._project_world_to_screen(camera, np.array([0.0, 0.0, size], dtype=np.float32))
+        if ax0 and ax1:
+            self._draw_line_on_rgba(rgba, ax0, ax1, (0.82, 0.22, 0.22), 0.65)
+        if az0 and az1:
+            self._draw_line_on_rgba(rgba, az0, az1, (0.20, 0.35, 0.82), 0.65)
+
+        # Draw a small center marker.
+        center = self._project_world_to_screen(camera, np.array([0.0, 0.0, 0.0], dtype=np.float32))
+        if center:
+            cx, cy = center
+            if 2 <= cx < width - 2 and 2 <= cy < rgba.shape[0] - 2:
+                rgba[cy - 2 : cy + 3, cx - 2 : cx + 3, :3] = np.array([0.15, 0.15, 0.15], dtype=np.float32)
+                rgba[cy - 2 : cy + 3, cx - 2 : cx + 3, 3] = 1.0
 
     def _load_mesh_model(self, mesh_model: MeshModel) -> None:
         viewport_size = self.state.viewport_size
@@ -298,6 +432,7 @@ class TexturePainterApp:
         if snapshot is None:
             return
         rgba = snapshot.rgba.astype(np.float32) / 255.0
+        self._draw_world_grid(rgba)
         if self.state.sketch_tool and self.state.sketch_tool.current:
             overlay = (
                 np.asarray(self.state.sketch_tool.current.image, dtype=np.float32)
@@ -307,6 +442,7 @@ class TexturePainterApp:
             rgba = overlay[:, :, :4] * alpha + rgba * (1.0 - alpha)
             rgba[:, :, 3] = 1.0
         dpg.set_value("viewport_texture", rgba.flatten().tolist())
+        self._position_nav_widget()
 
     def _mouse_inside_viewport(self) -> bool:
         return bool(dpg.is_item_hovered("viewport_image"))
@@ -316,8 +452,17 @@ class TexturePainterApp:
         image_x, image_y = dpg.get_item_rect_min("viewport_image")
         return mouse_x - image_x, mouse_y - image_y
 
+    def _mouse_within_frame(self, mouse_pos: tuple[float, float]) -> bool:
+        x, y = mouse_pos
+        width, height = self.state.viewport_size
+        return 0.0 <= x < float(width) and 0.0 <= y < float(height)
+
     def _pick_face(self, mouse_pos: tuple[float, float]) -> int | None:
-        if not self.state.mesh_model or not self.state.camera:
+        if (
+            not self.state.mesh_model
+            or not self.state.camera
+            or not self._mouse_within_frame(mouse_pos)
+        ):
             return None
         face_id = pick_face_cpu(
             self.state.mesh_model,
@@ -381,6 +526,8 @@ class TexturePainterApp:
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
+        if not self._mouse_within_frame(mouse_pos):
+            return
         button = app_data[0]
         self.state.dragging = True
         self.state.drag_button = button
@@ -450,6 +597,8 @@ class TexturePainterApp:
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
+        if not self._mouse_within_frame(mouse_pos):
+            return
         if (
             self.state.dragging
             and self.state.camera

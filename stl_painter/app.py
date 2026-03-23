@@ -253,7 +253,7 @@ class TexturePainterApp:
         dpg.set_value("status_text", text)
 
     def _load_mesh_model(self, mesh_model: MeshModel) -> None:
-        viewport_size = self._viewport_size()
+        viewport_size = self.state.viewport_size
         try:
             camera = OrbitCamera.for_mesh(mesh_model.vertices)
             renderer = MeshRenderer(self._create_context(), mesh_model, viewport_size)
@@ -271,28 +271,17 @@ class TexturePainterApp:
         self._set_status(f"Loaded mesh with {mesh_model.face_count} faces")
 
     def _viewport_size(self) -> tuple[int, int]:
-        width = max(320, int(dpg.get_item_rect_size("viewport_panel")[0]) - 16)
-        height = max(240, int(dpg.get_item_rect_size("viewport_panel")[1]) - 16)
-        return width, height
+        return self.state.viewport_size
 
     def _ensure_texture_size(self, size: tuple[int, int]) -> None:
-        if size == self.state.viewport_size:
-            return
-        self.state.viewport_size = size
-        if self.state.renderer:
-            self.state.renderer.resize(size)
-        if self.state.sketch_tool:
-            self.state.sketch_tool.resize(size)
-        dpg.delete_item("viewport_texture")
-        self._texture_data = np.zeros((size[1], size[0], 4), dtype=np.float32)
-        with dpg.texture_registry(show=False):
-            dpg.add_dynamic_texture(
-                size[0],
-                size[1],
-                self._texture_data.flatten().tolist(),
-                tag="viewport_texture",
-            )
-        dpg.configure_item("viewport_image", texture_tag="viewport_texture")
+        # Dynamic texture recreation during the render loop can crash in DearPyGui.
+        # Keep a fixed render target size for stability.
+        if size != self.state.viewport_size:
+            self.state.viewport_size = size
+            if self.state.renderer:
+                self.state.renderer.resize(size)
+            if self.state.sketch_tool:
+                self.state.sketch_tool.resize(size)
 
     def _render_snapshot(self) -> RenderSnapshot | None:
         if (
@@ -301,9 +290,7 @@ class TexturePainterApp:
             or not self.state.renderer
         ):
             # Show a software grid when no model is loaded to avoid a black viewport.
-            return make_grid_snapshot(self._viewport_size())
-        size = self._viewport_size()
-        self._ensure_texture_size(size)
+            return make_grid_snapshot(self.state.viewport_size)
         return self.state.renderer.render(self.state.camera)
 
     def _render_viewport(self) -> None:

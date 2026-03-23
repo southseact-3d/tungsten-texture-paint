@@ -33,6 +33,16 @@ class MeshModel:
         self.normals = np.asarray(self.normals, dtype=np.float32)
         self.face_colours = {int(face_id): clamp_color(colour) for face_id, colour in self.face_colours.items()}
         self.default_colour = clamp_color(self.default_colour)
+        if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
+            raise ValueError(f"Expected vertices shaped (n, 3), got {self.vertices.shape}")
+        if self.faces.ndim != 2 or self.faces.shape[1] != 3:
+            raise ValueError(f"Expected triangular faces shaped (n, 3), got {self.faces.shape}")
+        if self.face_count == 0:
+            raise ValueError("Mesh does not contain any faces after import cleanup")
+        if self.normals.shape != (self.face_count, 3):
+            raise ValueError(
+                f"Expected normals shaped ({self.face_count}, 3), got {self.normals.shape}"
+            )
 
     @classmethod
     def from_trimesh(cls, mesh: trimesh.Trimesh, *, source_path: str | None = None) -> "MeshModel":
@@ -41,10 +51,22 @@ class MeshModel:
         deduped.remove_unreferenced_vertices()
         deduped.merge_vertices()
         deduped.update_faces(deduped.nondegenerate_faces())
+        deduped.remove_unreferenced_vertices()
+        deduped.remove_infinite_values()
+        unique_faces = deduped.unique_faces()
+        if unique_faces is not None:
+            deduped.update_faces(unique_faces)
+            deduped.remove_unreferenced_vertices()
+        normals = np.asarray(deduped.face_normals, dtype=np.float32)
+        if normals.shape != (len(deduped.faces), 3) or not np.isfinite(normals).all():
+            normals = np.asarray(deduped.triangles_cross, dtype=np.float32)
+            lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+            safe_lengths = np.where(lengths > 1e-8, lengths, 1.0)
+            normals = normals / safe_lengths
         return cls(
             vertices=deduped.vertices.view(np.ndarray),
             faces=deduped.faces.view(np.ndarray),
-            normals=deduped.face_normals.view(np.ndarray),
+            normals=normals,
             source_path=source_path,
         )
 

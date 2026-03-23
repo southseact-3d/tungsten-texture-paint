@@ -1,19 +1,37 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from .camera import OrbitCamera
 from .mesh_model import MeshModel
 
+logger = logging.getLogger(__name__)
+_CPU_PICK_WARNING_EMITTED = False
+
 
 def pick_face_cpu(mesh_model: MeshModel, camera: OrbitCamera, mouse_x: float, mouse_y: float, viewport_size: tuple[int, int]) -> int | None:
+    global _CPU_PICK_WARNING_EMITTED
     origin, direction = camera.unproject_ray(mouse_x, mouse_y, viewport_size)
     mesh = mesh_model.mesh()
-    locations, _, face_ids = mesh.ray.intersects_location(
-        ray_origins=np.asarray([origin], dtype=np.float32),
-        ray_directions=np.asarray([direction], dtype=np.float32),
-        multiple_hits=True,
-    )
+    try:
+        locations, _, face_ids = mesh.ray.intersects_location(
+            ray_origins=np.asarray([origin], dtype=np.float32),
+            ray_directions=np.asarray([direction], dtype=np.float32),
+            multiple_hits=True,
+        )
+    except ModuleNotFoundError as exc:
+        if not _CPU_PICK_WARNING_EMITTED:
+            logger.warning(
+                "CPU picking disabled because an optional dependency is missing: %s",
+                exc,
+            )
+            _CPU_PICK_WARNING_EMITTED = True
+        return None
+    except Exception:
+        logger.exception("CPU picking failed unexpectedly")
+        return None
     if len(face_ids) == 0:
         return None
     distances = np.linalg.norm(locations - origin[None, :], axis=1)

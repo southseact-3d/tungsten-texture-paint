@@ -4,7 +4,7 @@ from typing import Iterable
 
 Color = tuple[int, int, int, int]
 
-DEFAULT_COLOR: Color = (220, 220, 220, 255)
+DEFAULT_COLOR: Color = (176, 184, 196, 255)
 
 
 def clamp_color(color: Iterable[int | float]) -> Color:

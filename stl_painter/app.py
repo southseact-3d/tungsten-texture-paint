@@ -463,7 +463,16 @@ class TexturePainterApp:
         self.state.viewport_dirty = False
 
     def _mouse_inside_viewport(self) -> bool:
-        return bool(dpg.is_item_hovered("viewport_image"))
+        if not dpg.does_item_exist("viewport_image"):
+            return False
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+        image_x, image_y = dpg.get_item_rect_min("viewport_image")
+        image_width, image_height = dpg.get_item_rect_size("viewport_image")
+        within_image = (
+            image_x <= mouse_x < image_x + image_width
+            and image_y <= mouse_y < image_y + image_height
+        )
+        return within_image or self._nav_pad_hovered()
 
     def _viewport_mouse_position(self) -> tuple[float, float]:
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)

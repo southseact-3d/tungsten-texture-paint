@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 ToolMode = Literal["paint", "fill", "sketch"]
 SketchPrimitive = Literal["text", "rect", "line", "freehand"]
+NavAxis = Literal["xp", "xn", "yp", "yn", "zp", "zn"]
 
 # Light and dark theme colors
 LIGHT_BG_COLOR = (0.95, 0.95, 0.95, 1.0)  # Light gray
@@ -61,6 +62,7 @@ class AppState:
     drag_origin: tuple[float, float] | None = None
     nav_dragging: bool = False
     nav_drag_origin: tuple[float, float] | None = None
+    nav_hover_axis: NavAxis | None = None
     freehand_points: list[tuple[float, float]] | None = None
     viewport_dirty: bool = True
 
@@ -202,9 +204,8 @@ class TexturePainterApp:
                         no_collapse=True,
                         autosize=True,
                     ):
-                        dpg.add_text("Orbit")
-                        dpg.add_text("Drag pad", color=(90, 96, 108, 255))
-                        dpg.add_drawlist(width=120, height=120, tag="viewport_nav_pad")
+                        dpg.add_text("View")
+                        dpg.add_drawlist(width=132, height=132, tag="viewport_nav_pad")
                         dpg.add_button(label="Home", width=72, callback=self._reset_view)
                     with dpg.handler_registry():
                         dpg.add_mouse_down_handler(callback=self._on_mouse_down)
@@ -279,24 +280,161 @@ class TexturePainterApp:
         if not dpg.does_item_exist("viewport_nav_pad"):
             return
         dpg.delete_item("viewport_nav_pad", children_only=True)
-        width, height = 120, 120
-        center = (width // 2, height // 2)
-        radius = 46
-        dpg.draw_rectangle((0, 0), (width, height), color=(0, 0, 0, 0), fill=(245, 246, 249, 255), parent="viewport_nav_pad")
-        dpg.draw_circle(center, radius, color=(120, 130, 145, 255), thickness=2, parent="viewport_nav_pad")
-        dpg.draw_line((center[0] - radius, center[1]), (center[0] + radius, center[1]), color=(196, 201, 210, 255), parent="viewport_nav_pad")
-        dpg.draw_line((center[0], center[1] - radius), (center[0], center[1] + radius), color=(196, 201, 210, 255), parent="viewport_nav_pad")
+        gizmo = self._nav_gizmo_geometry()
+        center = gizmo["center"]
+        radius = gizmo["radius"]
+        orbit_radius = gizmo["orbit_radius"]
+        dpg.draw_circle(
+            center,
+            radius,
+            color=(118, 126, 140, 220),
+            fill=(243, 245, 248, 210),
+            thickness=2,
+            parent="viewport_nav_pad",
+        )
+        dpg.draw_circle(
+            center,
+            orbit_radius,
+            color=(208, 212, 220, 180),
+            thickness=1,
+            parent="viewport_nav_pad",
+        )
+        dpg.draw_circle(
+            center,
+            4,
+            color=(84, 90, 100, 255),
+            fill=(84, 90, 100, 255),
+            parent="viewport_nav_pad",
+        )
         if self.state.camera is None:
-            indicator = center
-        else:
-            x = center[0] + int(np.cos(np.radians(self.state.camera.azimuth)) * radius * 0.65)
-            y = center[1] + int(np.sin(np.radians(self.state.camera.elevation)) * radius * 0.65)
-            indicator = (x, y)
-        dpg.draw_circle(indicator, 10, color=(27, 38, 59, 255), fill=(73, 102, 148, 255), parent="viewport_nav_pad")
-        dpg.draw_text((10, 100), "Free rotate", color=(72, 79, 90, 255), size=14, parent="viewport_nav_pad")
+            dpg.draw_text((40, 112), "Drag to rotate", color=(82, 88, 96, 255), size=13, parent="viewport_nav_pad")
+            return
+
+        axis_items = self._nav_axis_items()
+        for item in sorted(axis_items, key=lambda axis: axis["depth"], reverse=True):
+            start = center
+            end = item["point"]
+            line_colour = item["line_colour"]
+            if not item["positive"]:
+                line_colour = (*line_colour[:3], 90)
+            dpg.draw_line(start, end, color=line_colour, thickness=2, parent="viewport_nav_pad")
+
+        for item in sorted(axis_items, key=lambda axis: axis["depth"], reverse=True):
+            point = item["point"]
+            hovered = self.state.nav_hover_axis == item["axis"]
+            if item["positive"]:
+                fill = item["fill"]
+                outline = (24, 24, 28, 255) if hovered else item["outline"]
+                radius_px = 16 if hovered else 14
+                dpg.draw_circle(
+                    point,
+                    radius_px,
+                    color=outline,
+                    fill=fill,
+                    thickness=2,
+                    parent="viewport_nav_pad",
+                )
+                text_pos = (point[0] - 6, point[1] - 10)
+                dpg.draw_text(text_pos, item["label"], color=(255, 255, 255, 255), size=18, parent="viewport_nav_pad")
+            else:
+                radius_px = 11 if hovered else 9
+                dpg.draw_circle(
+                    point,
+                    radius_px,
+                    color=item["outline"],
+                    fill=(0, 0, 0, 0),
+                    thickness=2,
+                    parent="viewport_nav_pad",
+                )
+
+        dpg.draw_text((28, 112), "Drag to rotate", color=(82, 88, 96, 255), size=13, parent="viewport_nav_pad")
 
     def _nav_pad_hovered(self) -> bool:
         return dpg.does_item_exist("viewport_nav_pad") and bool(dpg.is_item_hovered("viewport_nav_pad"))
+
+    def _nav_gizmo_geometry(self) -> dict[str, object]:
+        width, height = 132, 132
+        return {
+            "size": (width, height),
+            "center": (width / 2.0, height / 2.0),
+            "radius": 44.0,
+            "orbit_radius": 34.0,
+            "axis_length": 32.0,
+            "handle_radius": 14.0,
+        }
+
+    def _nav_pad_mouse_position(self) -> tuple[float, float] | None:
+        if not dpg.does_item_exist("viewport_nav_pad"):
+            return None
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+        pad_x, pad_y = dpg.get_item_rect_min("viewport_nav_pad")
+        return mouse_x - pad_x, mouse_y - pad_y
+
+    def _nav_axis_items(self) -> list[dict[str, object]]:
+        if self.state.camera is None:
+            return []
+        gizmo = self._nav_gizmo_geometry()
+        center_x, center_y = gizmo["center"]  # type: ignore[misc]
+        axis_length = float(gizmo["axis_length"])
+        rotation = self.state.camera.view_matrix()[:3, :3]
+        axes: list[tuple[NavAxis, np.ndarray, tuple[int, int, int, int], str, bool]] = [
+            ("xp", np.array([1.0, 0.0, 0.0], dtype=np.float32), (227, 74, 89, 255), "X", True),
+            ("xn", np.array([-1.0, 0.0, 0.0], dtype=np.float32), (227, 74, 89, 255), "X", False),
+            ("yp", np.array([0.0, 1.0, 0.0], dtype=np.float32), (130, 196, 55, 255), "Y", True),
+            ("yn", np.array([0.0, -1.0, 0.0], dtype=np.float32), (130, 196, 55, 255), "Y", False),
+            ("zp", np.array([0.0, 0.0, 1.0], dtype=np.float32), (64, 150, 255, 255), "Z", True),
+            ("zn", np.array([0.0, 0.0, -1.0], dtype=np.float32), (64, 150, 255, 255), "Z", False),
+        ]
+        items: list[dict[str, object]] = []
+        for axis_name, direction, colour, label, positive in axes:
+            camera_space = rotation @ direction
+            point = (
+                center_x + float(camera_space[0]) * axis_length,
+                center_y - float(camera_space[1]) * axis_length,
+            )
+            items.append(
+                {
+                    "axis": axis_name,
+                    "label": label,
+                    "positive": positive,
+                    "point": point,
+                    "depth": float(camera_space[2]),
+                    "fill": colour if positive else (0, 0, 0, 0),
+                    "outline": colour,
+                    "line_colour": colour,
+                }
+            )
+        return items
+
+    def _nav_hit_test(self, mouse_pos: tuple[float, float]) -> tuple[str, NavAxis | None]:
+        gizmo = self._nav_gizmo_geometry()
+        handle_radius = float(gizmo["handle_radius"])
+        center_x, center_y = gizmo["center"]  # type: ignore[misc]
+        dx = mouse_pos[0] - center_x
+        dy = mouse_pos[1] - center_y
+        for item in self._nav_axis_items():
+            point_x, point_y = item["point"]  # type: ignore[misc]
+            if (mouse_pos[0] - point_x) ** 2 + (mouse_pos[1] - point_y) ** 2 <= (handle_radius + 5.0) ** 2:
+                return "axis", item["axis"]  # type: ignore[return-value]
+        if dx * dx + dy * dy <= (float(gizmo["radius"]) + 8.0) ** 2:
+            return "orbit", None
+        return "none", None
+
+    def _snap_camera_to_axis(self, axis: NavAxis) -> None:
+        if self.state.camera is None:
+            return
+        targets: dict[NavAxis, tuple[float, float]] = {
+            "xp": (0.0, 0.0),
+            "xn": (180.0, 0.0),
+            "yp": (0.0, 89.0),
+            "yn": (0.0, -89.0),
+            "zp": (90.0, 0.0),
+            "zn": (-90.0, 0.0),
+        }
+        azimuth, elevation = targets[axis]
+        self.state.camera.set_angles(azimuth, elevation)
+        self._mark_viewport_dirty()
+        self._render_viewport()
 
     def _project_world_to_screen(
         self, camera: OrbitCamera, point: np.ndarray
@@ -556,9 +694,15 @@ class TexturePainterApp:
 
     def _on_mouse_down(self, sender: int, app_data: tuple[int, float]) -> None:
         if self._nav_pad_hovered() and self.state.camera is not None and app_data[0] == 0:
-            self.state.nav_dragging = True
-            self.state.nav_drag_origin = self._viewport_mouse_position()
-            return
+            nav_pos = self._nav_pad_mouse_position()
+            if nav_pos is not None:
+                action, axis = self._nav_hit_test(nav_pos)
+                if action == "axis" and axis is not None:
+                    self._snap_camera_to_axis(axis)
+                elif action == "orbit":
+                    self.state.nav_dragging = True
+                    self.state.nav_drag_origin = nav_pos
+                return
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
@@ -637,11 +781,21 @@ class TexturePainterApp:
         self.state.drag_origin = None
 
     def _on_mouse_move(self, sender: int, app_data: tuple[float, float]) -> None:
+        nav_pos = self._nav_pad_mouse_position() if self._nav_pad_hovered() else None
+        if nav_pos is not None:
+            action, axis = self._nav_hit_test(nav_pos)
+            self.state.nav_hover_axis = axis if action == "axis" else None
+            self._draw_nav_pad()
+        elif self.state.nav_hover_axis is not None:
+            self.state.nav_hover_axis = None
+            self._draw_nav_pad()
         if self.state.nav_dragging and self.state.camera and self.state.nav_drag_origin is not None:
-            mouse_pos = self._viewport_mouse_position()
+            mouse_pos = self._nav_pad_mouse_position()
+            if mouse_pos is None:
+                return
             dx = mouse_pos[0] - self.state.nav_drag_origin[0]
             dy = mouse_pos[1] - self.state.nav_drag_origin[1]
-            self.state.camera.orbit(dx * 0.6, dy * 0.6)
+            self.state.camera.orbit(dx * 0.6, -dy * 0.6)
             self.state.nav_drag_origin = mouse_pos
             self._mark_viewport_dirty()
             self._render_viewport()
@@ -659,7 +813,7 @@ class TexturePainterApp:
             dx = mouse_pos[0] - self.state.drag_origin[0]
             dy = mouse_pos[1] - self.state.drag_origin[1]
             if self.state.drag_button == 1:
-                self.state.camera.orbit(dx * 0.4, dy * 0.4)
+                self.state.camera.orbit(dx * 0.4, -dy * 0.4)
                 self.state.drag_origin = mouse_pos
                 self._mark_viewport_dirty()
                 self._render_viewport()

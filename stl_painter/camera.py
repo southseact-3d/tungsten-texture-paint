@@ -80,6 +80,10 @@ class OrbitCamera:
         self.azimuth += delta_x
         self.elevation = float(np.clip(self.elevation + delta_y, -89.0, 89.0))
 
+    def set_angles(self, azimuth: float, elevation: float) -> None:
+        self.azimuth = float(azimuth)
+        self.elevation = float(np.clip(elevation, -89.0, 89.0))
+
     def zoom(self, delta: float) -> None:
         self.distance = max(0.05, self.distance * (1.0 - delta))
 

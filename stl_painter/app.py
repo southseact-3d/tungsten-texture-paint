@@ -83,6 +83,7 @@ class AppState:
     nav_pressed_axis: NavAxis | None = None
     nav_drag_moved: bool = False
     freehand_points: list[tuple[float, float]] | None = None
+    tab_down: bool = False
     viewport_dirty: bool = True
 
 
@@ -90,6 +91,12 @@ class TexturePainterApp:
     def __init__(self) -> None:
         self.state = AppState(sketch_tool=SketchTool((960, 720)))
         self.state.camera = OrbitCamera(np.array([0.0, 0.0, 0.0], dtype=np.float32), 5.0)
+        self._key_tab = getattr(dpg, "mvKey_Tab", 512)
+        self._key_lshift = getattr(dpg, "mvKey_LShift", 528)
+        self._key_rshift = getattr(dpg, "mvKey_RShift", 532)
+        self._key_lctrl = getattr(dpg, "mvKey_LControl", 527)
+        self._key_rctrl = getattr(dpg, "mvKey_RControl", 531)
+        self._key_z = getattr(dpg, "mvKey_Z", 571)
         self._texture_data = np.zeros(
             (self.state.viewport_size[1], self.state.viewport_size[0], 4),
             dtype=np.float32,
@@ -310,6 +317,12 @@ class TexturePainterApp:
             "paint" if self.state.workspace_mode == "preview" else "preview"
         )
         self._set_workspace_mode(next_mode)
+
+    def _poll_keyboard_shortcuts(self) -> None:
+        tab_down = bool(dpg.is_key_down(self._key_tab))
+        if tab_down and not self.state.tab_down:
+            self._toggle_workspace_mode()
+        self.state.tab_down = tab_down
 
     def _select_palette_colour(self, index: int) -> None:
         self.state.active_colour = PALETTE[index]
@@ -1019,20 +1032,17 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
 
     def _on_key_down(self, sender: int, app_data: int) -> None:
-        if app_data in (340, 344):
+        if app_data in (self._key_lshift, self._key_rshift):
             self.state.shift_down = True
-        if app_data in (341, 345):
+        if app_data in (self._key_lctrl, self._key_rctrl):
             self.state.ctrl_down = True
-        if app_data == getattr(dpg, "mvKey_Tab", 258):
-            self._toggle_workspace_mode()
-            return
-        if self.state.ctrl_down and app_data == 90:
+        if self.state.ctrl_down and app_data == self._key_z:
             self._on_undo()
 
     def _on_key_release(self, sender: int, app_data: int) -> None:
-        if app_data in (340, 344):
+        if app_data in (self._key_lshift, self._key_rshift):
             self.state.shift_down = False
-        if app_data in (341, 345):
+        if app_data in (self._key_lctrl, self._key_rctrl):
             self.state.ctrl_down = False
 
     def _on_open_selected(self, sender: int, app_data: dict[str, object]) -> None:
@@ -1117,6 +1127,7 @@ class TexturePainterApp:
         try:
             while dpg.is_dearpygui_running():
                 try:
+                    self._poll_keyboard_shortcuts()
                     self._render_viewport()
                 except Exception as exc:
                     logger.exception("Render loop failure")

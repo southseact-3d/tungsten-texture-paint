@@ -38,6 +38,17 @@ PALETTE: list[Color] = [
 ]
 
 
+def _normalise_picker_colour(app_data: list[float] | tuple[float, ...]) -> Color:
+    if not app_data:
+        return (255, 80, 80, 255)
+    values = [float(item) for item in list(app_data)[:4]]
+    while len(values) < 4:
+        values.append(255.0 if len(values) == 3 else 0.0)
+    if max(values) <= 1.0:
+        values = [value * 255.0 for value in values]
+    return clamp_color(tuple(int(round(value)) for value in values))
+
+
 class TexturePainterApp:
     def __init__(self) -> None:
         self.state = InteractionState()
@@ -53,6 +64,7 @@ class TexturePainterApp:
         )
         self._last_brush_face: int | None = None
         self._load_ai_settings()
+        self._load_svg_settings()
         self._create_ui()
 
     def _load_ai_settings(self) -> None:
@@ -84,6 +96,15 @@ class TexturePainterApp:
                 }
             }
         )
+
+    def _load_svg_settings(self) -> None:
+        payload = load_local_config()
+        self.state.recent_svgs = [str(path) for path in payload.get("recent_svgs", []) if Path(str(path)).exists()]
+        tint = payload.get("last_svg_tint", list(self.state.svg_tint))
+        self.state.svg_tint = clamp_color(tuple(tint))
+
+    def _save_svg_settings(self) -> None:
+        save_local_config({"recent_svgs": self.state.recent_svgs[:10], "last_svg_tint": list(self.state.svg_tint)})
 
     def _create_ui(self) -> None:
         dpg.create_context()
@@ -126,7 +147,7 @@ class TexturePainterApp:
 
     def _build_left_sidebar(self) -> None:
         with dpg.child_window(width=300, autosize_y=True):
-            dpg.add_text("Tools")
+            dpg.add_text("Mode")
             dpg.add_combo(
                 items=["paint", "sketch"],
                 default_value=self.state.interaction_mode,
@@ -135,7 +156,7 @@ class TexturePainterApp:
                 tag="interaction_mode_combo",
             )
             dpg.add_separator()
-            dpg.add_text("Shared")
+            dpg.add_text("Paint Colour")
             dpg.add_text("No mesh loaded", tag="mesh_info_text", wrap=260)
             for index, colour in enumerate(PALETTE):
                 dpg.add_color_button(
@@ -149,16 +170,22 @@ class TexturePainterApp:
                 default_value=list(self.state.active_colour),
                 callback=self._on_custom_colour,
                 tag="active_colour_picker",
+                alpha_bar=True,
             )
             with dpg.group(tag="paint_section"):
                 dpg.add_separator()
                 dpg.add_text("Paint")
                 dpg.add_combo(
-                    items=["brush", "fill", "sample", "erase", "mask"],
+                    items=["brush", "fill", "sample", "erase", "mask", "select"],
                     default_value=self.state.paint_tool,
                     label="Tool",
                     callback=self._set_paint_tool,
                     tag="paint_tool_combo",
+                )
+                dpg.add_checkbox(
+                    label="Paint Linked Faces as Group",
+                    default_value=self.state.paint_linked_faces,
+                    callback=lambda _s, value: setattr(self.state, "paint_linked_faces", bool(value)),
                 )
                 dpg.add_slider_float(
                     label="Radius",
@@ -194,17 +221,23 @@ class TexturePainterApp:
                 )
                 dpg.add_button(label="Clear Mask", callback=self._on_clear_mask)
                 dpg.add_button(label="Invert Mask", callback=self._on_invert_mask)
+                dpg.add_button(label="Paint Selected", callback=self._paint_selected_faces)
+                dpg.add_button(label="Mask Selected", callback=self._mask_selected_faces)
+                dpg.add_button(label="Clear Selection", callback=self._clear_face_selection)
                 dpg.add_text("Masked faces: 0", tag="mask_count_text")
+                dpg.add_text("Selected faces: 0", tag="selected_count_text")
             with dpg.group(tag="sketch_section", show=False):
                 dpg.add_separator()
                 dpg.add_text("Sketch")
                 dpg.add_combo(
-                    items=["select", "line", "rect", "circle", "text"],
+                    items=["select", "line", "rect", "circle", "text", "svg"],
                     default_value=self.state.sketch_tool,
                     label="Tool",
                     callback=self._set_sketch_tool,
                     tag="sketch_tool_combo",
                 )
+                dpg.add_button(label="Import SVG", callback=lambda: dpg.show_item("svg_dialog"))
+                dpg.add_combo(items=self.state.recent_svgs or [""], label="Recent SVGs", tag="recent_svg_combo", callback=self._on_recent_svg_selected)
                 dpg.add_input_text(label="Text", default_value="Text", tag="sketch_text_value")
                 dpg.add_slider_int(label="Text Size", min_value=8, max_value=120, default_value=28, tag="sketch_text_size")
                 dpg.add_slider_float(
@@ -259,6 +292,8 @@ class TexturePainterApp:
             dpg.add_file_extension(".png")
             dpg.add_file_extension(".jpg")
             dpg.add_file_extension(".jpeg")
+        with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_svg_selected, tag="svg_dialog", width=700, height=400):
+            dpg.add_file_extension(".svg")
 
     def _set_status(self, text: str) -> None:
         dpg.set_value("status_text", text)
@@ -276,6 +311,7 @@ class TexturePainterApp:
 
     def _set_paint_tool(self, _sender: int, app_data: str) -> None:
         self.state.paint_tool = app_data
+        self._set_status(f"Paint tool: {app_data}")
 
     def _set_sketch_tool(self, _sender: int, app_data: str) -> None:
         self.state.sketch_tool = app_data
@@ -305,7 +341,30 @@ class TexturePainterApp:
         dpg.set_value("active_colour_picker", list(self.state.active_colour))
 
     def _on_custom_colour(self, _sender: int, app_data: list[float]) -> None:
-        self.state.active_colour = clamp_color(app_data)
+        self.state.active_colour = _normalise_picker_colour(app_data)
+
+    def _clear_face_selection(self) -> None:
+        self.state.selected_faces.clear()
+        self._refresh_selected_count()
+        self._mark_viewport_dirty()
+
+    def _refresh_selected_count(self) -> None:
+        dpg.set_value("selected_count_text", f"Selected faces: {len(self.state.selected_faces)}")
+
+    def _mask_selected_faces(self) -> None:
+        if self.mesh_model is None or not self.state.selected_faces:
+            return
+        masked = set(self.mesh_model.masked_faces).union(self.state.selected_faces)
+        touched = self.commands.set_masked_faces(masked, description="Mask selected faces")
+        self._apply_updates(touched)
+        self._refresh_mask_count()
+
+    def _paint_selected_faces(self) -> None:
+        if not self.state.selected_faces:
+            return
+        updates = {face_id: self.state.active_colour for face_id in self.state.selected_faces}
+        touched = self.commands.paint_faces(updates, description="Paint selected faces")
+        self._apply_updates(touched)
 
     def _active_document(self):
         if self.mesh_model is None or not self.mesh_model.sketch_documents:
@@ -314,6 +373,8 @@ class TexturePainterApp:
 
     def _load_mesh_model(self, mesh_model: MeshModel) -> None:
         self.mesh_model = mesh_model
+        if not mesh_model.face_groups:
+            mesh_model.compute_face_groups()
         self.camera = OrbitCamera.for_mesh(mesh_model.vertices)
         self.renderer = MeshRenderer(None, mesh_model, self.state.viewport_size, prefer_gpu=False)
         self.paint_tool = PaintTool(mesh_model)
@@ -324,6 +385,7 @@ class TexturePainterApp:
             f"{Path(mesh_model.source_path or 'project').name}\nFaces: {mesh_model.face_count}\nVertices: {mesh_model.vertex_count}\nMasked: {len(mesh_model.masked_faces)}",
         )
         self._refresh_mask_count()
+        self._refresh_selected_count()
         self._set_status(f"Loaded {Path(mesh_model.source_path or 'project').name}")
 
     def _render_snapshot(self) -> RenderSnapshot:
@@ -439,6 +501,25 @@ class TexturePainterApp:
             if point:
                 self._draw_point(rgba, point, (0.0, 0.0, 0.0))
 
+    def _overlay_selected_faces(self, rgba: np.ndarray) -> None:
+        if self.mesh_model is None:
+            return
+        for face_id in list(self.state.selected_faces)[:500]:
+            point = self._project_world_to_screen(self.mesh_model.face_center(face_id))
+            if point:
+                self._draw_point(rgba, point, (1.0, 1.0, 0.0))
+        if self.state.marquee_start is not None and self.state.marquee_end is not None:
+            x0, y0 = int(self.state.marquee_start[0]), int(self.state.marquee_start[1])
+            x1, y1 = int(self.state.marquee_end[0]), int(self.state.marquee_end[1])
+            p00 = (x0, y0)
+            p10 = (x1, y0)
+            p11 = (x1, y1)
+            p01 = (x0, y1)
+            self._draw_line(rgba, p00, p10, (1.0, 1.0, 0.2), alpha=0.8)
+            self._draw_line(rgba, p10, p11, (1.0, 1.0, 0.2), alpha=0.8)
+            self._draw_line(rgba, p11, p01, (1.0, 1.0, 0.2), alpha=0.8)
+            self._draw_line(rgba, p01, p00, (1.0, 1.0, 0.2), alpha=0.8)
+
     def _render_viewport(self) -> None:
         if not self.state.viewport_dirty:
             return
@@ -447,6 +528,7 @@ class TexturePainterApp:
         if self.mesh_model is not None:
             self._overlay_sketch_entities(rgba)
             self._overlay_masked_faces(rgba)
+            self._overlay_selected_faces(rgba)
         self._texture_data[:, :, :] = rgba
         dpg.set_value("viewport_texture", self._texture_data)
         self.state.viewport_dirty = False
@@ -506,6 +588,14 @@ class TexturePainterApp:
                 angle_tolerance_degrees=self.state.brush.angle_tolerance_degrees,
                 erase=(tool == "erase"),
             )
+        if self.state.paint_linked_faces and self.mesh_model is not None and updates:
+            group_id = self.mesh_model.group_for_face(pick.face_id)
+            if group_id is not None:
+                grouped_faces = self.mesh_model.faces_for_group(group_id)
+                group_colour = self.state.active_colour if tool != "erase" else self.mesh_model.default_colour
+                for face_id in grouped_faces:
+                    if face_id not in self.mesh_model.masked_faces:
+                        updates[face_id] = group_colour
         touched = self.commands.paint_faces(updates, description=f"{tool.title()} stroke")
         self._apply_updates(touched)
 
@@ -533,7 +623,7 @@ class TexturePainterApp:
             return None
         best: tuple[str, str] | None = None
         best_distance = 18.0
-        handle_names = {"rect": ["min", "max", "center"], "line": ["start", "end"], "circle": ["radius"], "text": ["position"]}
+        handle_names = {"rect": ["min", "max", "center"], "line": ["start", "end"], "circle": ["radius"], "text": ["position"], "svg": ["min", "max", "center"]}
         for entity in document.entities:
             names = handle_names.get(entity.kind, ["position"])
             for index, point_uv in enumerate(entity_snap_points(entity)[: len(names)]):
@@ -565,10 +655,15 @@ class TexturePainterApp:
         if button != 0:
             return
         if self.state.interaction_mode == "paint":
-            pick = self._pick_result(mouse_pos)
-            if pick is not None:
-                self._apply_paint_at_pick(pick)
-                self._last_brush_face = pick.face_id
+            if self.state.paint_tool == "select":
+                self.state.marquee_start = mouse_pos
+                self.state.marquee_end = mouse_pos
+                self._mark_viewport_dirty()
+            else:
+                pick = self._pick_result(mouse_pos)
+                if pick is not None:
+                    self._apply_paint_at_pick(pick)
+                    self._last_brush_face = pick.face_id
             return
         if self._active_document() is None:
             pick = self._pick_result(mouse_pos)
@@ -597,6 +692,16 @@ class TexturePainterApp:
                 text=str(dpg.get_value("sketch_text_value")),
                 text_size=int(dpg.get_value("sketch_text_size")),
             )
+            self.commands.add_sketch_entity(self._active_document(), entity)
+            self._mark_viewport_dirty()
+        elif self.state.sketch_tool == "svg":
+            path = str(dpg.get_value("recent_svg_combo")).strip()
+            if not path:
+                self._set_status("Import/select an SVG first")
+                return
+            entity = self.sketch_tool.create_entity("svg", start_uv, start_uv + np.asarray([0.2, 0.2], dtype=np.float32), self.state.svg_tint)
+            entity.data["path"] = path
+            entity.data["tint"] = list(self.state.svg_tint)
             self.commands.add_sketch_entity(self._active_document(), entity)
             self._mark_viewport_dirty()
 
@@ -628,11 +733,33 @@ class TexturePainterApp:
                     new_data = self.sketch_tool.resize_entity(entity, self.state.active_handle, end_uv)
                     self.commands.update_sketch_entity(document, entity.entity_id, new_data)
                     self._mark_viewport_dirty()
+        if button == 0 and self.state.interaction_mode == "paint" and self.state.paint_tool == "select":
+            self._finish_marquee_selection()
         self.state.dragging = False
         self.state.drag_button = None
         self.state.drag_origin_screen = None
         self.state.drag_origin_plane = None
         self.state.active_handle = None
+
+    def _finish_marquee_selection(self) -> None:
+        if self.mesh_model is None or self.state.marquee_start is None or self.state.marquee_end is None:
+            return
+        min_x = min(self.state.marquee_start[0], self.state.marquee_end[0])
+        max_x = max(self.state.marquee_start[0], self.state.marquee_end[0])
+        min_y = min(self.state.marquee_start[1], self.state.marquee_end[1])
+        max_y = max(self.state.marquee_start[1], self.state.marquee_end[1])
+        selected: set[int] = set()
+        for face_id in range(self.mesh_model.face_count):
+            point = self._project_world_to_screen(self.mesh_model.face_center(face_id))
+            if point is None:
+                continue
+            if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y:
+                selected.add(face_id)
+        self.state.selected_faces = selected
+        self.state.marquee_start = None
+        self.state.marquee_end = None
+        self._refresh_selected_count()
+        self._mark_viewport_dirty()
 
     def _on_mouse_move(self, _sender: int, _app_data: tuple[float, float]) -> None:
         if not self._mouse_inside_viewport() or not self.state.dragging or self.state.drag_origin_screen is None:
@@ -655,6 +782,9 @@ class TexturePainterApp:
             if pick is not None and pick.face_id != self._last_brush_face:
                 self._apply_paint_at_pick(pick)
                 self._last_brush_face = pick.face_id
+        elif self.state.drag_button == 0 and self.state.interaction_mode == "paint" and self.state.paint_tool == "select":
+            self.state.marquee_end = mouse_pos
+            self._mark_viewport_dirty()
 
     def _on_mouse_wheel(self, _sender: int, app_data: float) -> None:
         if not self._mouse_inside_viewport():
@@ -704,6 +834,24 @@ class TexturePainterApp:
         self.state.ai_settings.image_path = str(app_data["file_path_name"])
         dpg.set_value("ai_image_path", self.state.ai_settings.image_path)
         self._save_ai_settings()
+
+    def _on_svg_selected(self, _sender: int, app_data: dict[str, object]) -> None:
+        path = str(app_data["file_path_name"])
+        self._push_recent_svg(path)
+        dpg.set_value("recent_svg_combo", path)
+        self._set_status(f"Selected SVG {Path(path).name}")
+
+    def _on_recent_svg_selected(self, _sender: int, app_data: str) -> None:
+        if app_data:
+            self._push_recent_svg(str(app_data))
+
+    def _push_recent_svg(self, path: str) -> None:
+        normalized = str(Path(path))
+        self.state.recent_svgs = [item for item in self.state.recent_svgs if item != normalized]
+        self.state.recent_svgs.insert(0, normalized)
+        self.state.recent_svgs = [item for item in self.state.recent_svgs if Path(item).exists()][:10]
+        dpg.configure_item("recent_svg_combo", items=self.state.recent_svgs or [""])
+        self._save_svg_settings()
 
     def _on_bake_sketch(self) -> None:
         if self.mesh_model is None or self._active_document() is None:

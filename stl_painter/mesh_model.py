@@ -8,7 +8,7 @@ import trimesh
 
 from .color_utils import DEFAULT_COLOR, Color, clamp_color
 
-PROJECT_VERSION = 2
+PROJECT_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -121,6 +121,8 @@ class MeshModel:
     interaction_mode: str = "paint"
     default_colour: Color = DEFAULT_COLOR
     source_path: str | None = None
+    face_groups: dict[str, list[int]] = field(default_factory=dict)
+    face_to_group: dict[int, str] = field(default_factory=dict)
     _adjacency: dict[int, set[int]] | None = field(default=None, init=False, repr=False)
     _mesh_cache: trimesh.Trimesh | None = field(default=None, init=False, repr=False)
     _face_centers: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -132,6 +134,11 @@ class MeshModel:
         self.face_colours = {int(face_id): clamp_color(colour) for face_id, colour in self.face_colours.items()}
         self.masked_faces = {int(face_id) for face_id in self.masked_faces}
         self.default_colour = clamp_color(self.default_colour)
+        self.face_groups = {
+            str(group_id): sorted({int(face_id) for face_id in faces})
+            for group_id, faces in self.face_groups.items()
+        }
+        self.face_to_group = {int(face_id): str(group_id) for face_id, group_id in self.face_to_group.items()}
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError(f"Expected vertices shaped (n, 3), got {self.vertices.shape}")
         if self.faces.ndim != 2 or self.faces.shape[1] != 3:
@@ -211,6 +218,52 @@ class MeshModel:
         self._adjacency = adjacency
         return adjacency
 
+    def compute_face_groups(self, angle_tolerance_degrees: float = 180.0) -> dict[str, list[int]]:
+        adjacency = self.adjacency_map()
+        max_angle = np.deg2rad(float(max(0.0, min(180.0, angle_tolerance_degrees))))
+        visited: set[int] = set()
+        groups: dict[str, list[int]] = {}
+        face_to_group: dict[int, str] = {}
+        group_index = 0
+        for start_face in range(self.face_count):
+            if start_face in visited:
+                continue
+            group_id = f"group_{group_index}"
+            group_index += 1
+            queue = [start_face]
+            members: list[int] = []
+            while queue:
+                face_id = queue.pop()
+                if face_id in visited:
+                    continue
+                visited.add(face_id)
+                members.append(face_id)
+                n0 = self.normals[face_id]
+                for neighbour in adjacency.get(face_id, set()):
+                    if neighbour in visited:
+                        continue
+                    n1 = self.normals[neighbour]
+                    dot = float(np.clip(np.dot(n0, n1), -1.0, 1.0))
+                    if float(np.arccos(dot)) <= max_angle:
+                        queue.append(neighbour)
+            members.sort()
+            groups[group_id] = members
+            for face_id in members:
+                face_to_group[face_id] = group_id
+        self.face_groups = groups
+        self.face_to_group = face_to_group
+        return groups
+
+    def group_for_face(self, face_id: int) -> str | None:
+        if not self.face_to_group:
+            self.compute_face_groups()
+        return self.face_to_group.get(int(face_id))
+
+    def faces_for_group(self, group_id: str) -> list[int]:
+        if not self.face_groups:
+            self.compute_face_groups()
+        return list(self.face_groups.get(str(group_id), []))
+
     def face_vertices(self, face_id: int) -> np.ndarray:
         return self.vertices[self.faces[int(face_id)]]
 
@@ -247,6 +300,8 @@ class MeshModel:
             "masked_faces": sorted(self.masked_faces),
             "interaction_mode": self.interaction_mode,
             "source_path": self.source_path,
+            "face_groups": {group_id: list(faces) for group_id, faces in self.face_groups.items()},
+            "face_to_group": {str(face_id): group_id for face_id, group_id in self.face_to_group.items()},
         }
 
     @classmethod
@@ -278,4 +333,6 @@ class MeshModel:
             masked_faces=set(payload.get("masked_faces", [])),
             interaction_mode=str(payload.get("interaction_mode", "paint")),
             source_path=payload.get("source_path"),
+            face_groups={str(group_id): [int(face_id) for face_id in faces] for group_id, faces in payload.get("face_groups", {}).items()},
+            face_to_group={int(face_id): str(group_id) for face_id, group_id in payload.get("face_to_group", {}).items()},
         )

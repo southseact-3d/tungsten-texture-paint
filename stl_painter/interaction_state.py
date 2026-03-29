@@ -8,7 +8,7 @@ import numpy as np
 from .color_utils import Color
 
 InteractionMode = Literal["paint", "sketch"]
-PaintMode = Literal["brush", "fill", "sample", "erase", "mask"]
+PaintMode = Literal["brush", "fill", "sample", "erase", "mask", "select"]
 SketchMode = Literal["select", "line", "rect", "circle", "text"]
 
 
@@ -46,6 +46,7 @@ class InteractionState:
     paint_tool: PaintMode = "brush"
     sketch_tool: SketchMode = "select"
     active_colour: Color = (255, 80, 80, 255)
+    paint_linked_faces: bool = False
     hovered_face: int | None = None
     drag_origin_screen: tuple[float, float] | None = None
     drag_origin_plane: np.ndarray | None = None
@@ -58,6 +59,11 @@ class InteractionState:
     selected_entity_id: str | None = None
     active_handle: str | None = None
     preview_entity_id: str | None = None
+    selected_faces: set[int] = field(default_factory=set)
+    marquee_start: tuple[float, float] | None = None
+    marquee_end: tuple[float, float] | None = None
+    svg_tint: Color = (255, 255, 255, 255)
+    recent_svgs: list[str] = field(default_factory=list)
     freehand_points: list[tuple[float, float]] = field(default_factory=list)
     brush: BrushSettings = field(default_factory=BrushSettings)
     ai_settings: AISettings = field(default_factory=AISettings)

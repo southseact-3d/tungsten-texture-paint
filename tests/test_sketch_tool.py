@@ -41,3 +41,15 @@ def test_snap_prefers_grid(square_mesh) -> None:
 
     assert snapped.snapped
     assert np.allclose(snapped.plane_uv, np.asarray([0.5, 0.0], dtype=np.float32), atol=1e-4)
+
+
+def test_svg_entity_can_be_resized(square_mesh) -> None:
+    tool = SketchTool()
+    entity = tool.create_entity(
+        "svg",
+        np.asarray([0.0, 0.0], dtype=np.float32),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+        (255, 255, 255, 255),
+    )
+    updated = tool.resize_entity(entity, "max", np.asarray([2.0, 3.0], dtype=np.float32))
+    assert updated["max"] == [2.0, 3.0]

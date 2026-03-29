@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .camera import OrbitCamera
 from .color_utils import Color, blend_over, clamp_color
 from .mesh_model import MeshModel, SketchDocument, SketchEntity, SketchPlane
+from .svg_tool import load_svg_as_image
 
 
 ASSET_DIR = Path(__file__).with_name("assets")
@@ -218,6 +219,15 @@ class SketchTool:
                 "colour": list(colour),
                 "size": int(text_size),
             }
+        elif kind == "svg":
+            mins = np.minimum(start_uv, end_uv)
+            maxs = np.maximum(start_uv, end_uv)
+            data = {
+                "min": mins.tolist(),
+                "max": maxs.tolist(),
+                "path": "",
+                "tint": list(colour),
+            }
         else:
             data = {
                 "start": start_uv.tolist(),
@@ -253,6 +263,20 @@ class SketchTool:
             data["radius"] = float(np.linalg.norm(new_uv - center))
         elif entity.kind == "text":
             data["position"] = new_uv.tolist()
+        elif entity.kind == "svg":
+            min_uv = np.asarray(data.get("min", [0.0, 0.0]), dtype=np.float32)
+            max_uv = np.asarray(data.get("max", [0.1, 0.1]), dtype=np.float32)
+            if handle == "min":
+                min_uv = new_uv
+            elif handle == "max":
+                max_uv = new_uv
+            else:
+                center = new_uv
+                size = (max_uv - min_uv) * 0.5
+                min_uv = center - size
+                max_uv = center + size
+            data["min"] = np.minimum(min_uv, max_uv).tolist()
+            data["max"] = np.maximum(min_uv, max_uv).tolist()
         return data
 
     def render_entity_to_image(
@@ -310,6 +334,25 @@ class SketchTool:
         elif entity.kind == "text":
             position = np.asarray(entity.data["position"], dtype=np.float32)
             draw.text(to_px(position), str(entity.data.get("text", "Text")), fill=colour, font=font)
+        elif entity.kind == "svg":
+            min_uv = np.asarray(entity.data.get("min", [0.0, 0.0]), dtype=np.float32)
+            max_uv = np.asarray(entity.data.get("max", [0.1, 0.1]), dtype=np.float32)
+            p0 = to_px(min_uv)
+            p1 = to_px(max_uv)
+            left = int(min(p0[0], p1[0]))
+            right = int(max(p0[0], p1[0]))
+            top = int(min(p0[1], p1[1]))
+            bottom = int(max(p0[1], p1[1]))
+            width = max(1, right - left)
+            height = max(1, bottom - top)
+            svg_image = load_svg_as_image(str(entity.data.get("path", "")), (width, height))
+            if svg_image is None:
+                return
+            tint = np.asarray(entity.data.get("tint", [255, 255, 255, 255]), dtype=np.uint8)
+            arr = np.asarray(svg_image, dtype=np.uint8).copy()
+            arr[:, :, :3] = ((arr[:, :, :3].astype(np.float32) * (tint[:3].astype(np.float32) / 255.0))).astype(np.uint8)
+            arr[:, :, 3] = ((arr[:, :, 3].astype(np.float32) * (float(tint[3]) / 255.0))).astype(np.uint8)
+            image.alpha_composite(Image.fromarray(arr, mode="RGBA"), (left, top))
 
     def bake_document_to_faces(
         self,
@@ -393,6 +436,11 @@ def entity_snap_points(entity: SketchEntity) -> list[np.ndarray]:
         ]
     if entity.kind == "text":
         return [np.asarray(entity.data["position"], dtype=np.float32)]
+    if entity.kind == "svg":
+        min_uv = np.asarray(entity.data.get("min", [0.0, 0.0]), dtype=np.float32)
+        max_uv = np.asarray(entity.data.get("max", [0.1, 0.1]), dtype=np.float32)
+        center = (min_uv + max_uv) * 0.5
+        return [min_uv, max_uv, center]
     return []
 
 

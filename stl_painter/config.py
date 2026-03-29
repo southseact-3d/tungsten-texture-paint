@@ -18,4 +18,8 @@ def load_local_config() -> dict[str, Any]:
 
 def save_local_config(payload: dict[str, Any]) -> None:
     path = app_config_path()
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    existing: dict[str, Any] = {}
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    merged = {**existing, **payload}
+    path.write_text(json.dumps(merged, indent=2), encoding="utf-8")

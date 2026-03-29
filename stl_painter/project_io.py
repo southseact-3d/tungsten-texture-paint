@@ -11,6 +11,11 @@ def migrate_project_payload(payload: dict[str, object]) -> dict[str, object]:
     migrated = dict(payload)
     if version < 2:
         migrated["project_version"] = 2
+        version = 2
+    if version < 3:
+        migrated.setdefault("face_groups", {})
+        migrated.setdefault("face_to_group", {})
+        migrated["project_version"] = 3
     if int(migrated.get("project_version", 1)) != PROJECT_VERSION:
         raise ValueError(
             f"Unsupported project version {migrated.get('project_version')} (expected {PROJECT_VERSION})"

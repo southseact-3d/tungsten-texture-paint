@@ -36,3 +36,11 @@ def test_mesh_model_rejects_empty_face_list() -> None:
             faces=np.empty((0, 3), dtype=np.int32),
             normals=np.empty((0, 3), dtype=np.float32),
         )
+
+
+def test_compute_face_groups_returns_connected_groups(square_mesh) -> None:
+    groups = square_mesh.compute_face_groups()
+    assert len(groups) == 1
+    group_id = square_mesh.group_for_face(0)
+    assert group_id is not None
+    assert square_mesh.faces_for_group(group_id) == [0, 1]

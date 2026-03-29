@@ -32,7 +32,7 @@
    pytest
    ```
 
-2. Test that the app can import an STL file by running:
+2. If you have changed anything that may affect the import functionailty , test that the app can import an STL file by running:
    ```bash
    python -c "from stl_painter.importer import import_stl; import_stl('dart.stl')"
    ```
@@ -41,5 +41,6 @@
    ```bash   python main.py
    ```
    Then verify you can load the test STL file (`dart.stl`) through the app.
+4. You must always ensure that you fully test your changes and do not stop until the functionality or fix is fully implemented, and you are sure that it will definetely work.
 
 **Failure to verify STL import after changes may result in the app being unable to load STL files, which is a critical feature.**

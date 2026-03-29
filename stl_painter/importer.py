@@ -38,3 +38,7 @@ def load_stl(path: str | Path) -> MeshModel:
         source_path,
     )
     return mesh_model
+
+
+def import_stl(path: str | Path) -> MeshModel:
+    return load_stl(path)

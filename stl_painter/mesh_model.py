@@ -17,21 +17,118 @@ class Stroke:
 
 
 @dataclass(slots=True)
+class SketchPlane:
+    origin: np.ndarray
+    normal: np.ndarray
+    tangent_u: np.ndarray
+    tangent_v: np.ndarray
+    anchor_face_id: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "origin": self.origin.tolist(),
+            "normal": self.normal.tolist(),
+            "tangent_u": self.tangent_u.tolist(),
+            "tangent_v": self.tangent_v.tolist(),
+            "anchor_face_id": self.anchor_face_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SketchPlane":
+        return cls(
+            origin=np.asarray(payload["origin"], dtype=np.float32),
+            normal=np.asarray(payload["normal"], dtype=np.float32),
+            tangent_u=np.asarray(payload["tangent_u"], dtype=np.float32),
+            tangent_v=np.asarray(payload["tangent_v"], dtype=np.float32),
+            anchor_face_id=int(payload["anchor_face_id"]),
+        )
+
+
+@dataclass(slots=True)
+class SketchEntity:
+    entity_id: str
+    kind: str
+    data: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entity_id": self.entity_id,
+            "kind": self.kind,
+            "data": self.data,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SketchEntity":
+        return cls(
+            entity_id=str(payload["entity_id"]),
+            kind=str(payload["kind"]),
+            data=dict(payload["data"]),
+        )
+
+
+@dataclass(slots=True)
+class SketchDocument:
+    plane: SketchPlane
+    entities: list[SketchEntity] = field(default_factory=list)
+    selected_entity_id: str | None = None
+    grid_size: float = 0.1
+    snap_to_grid: bool = True
+    snap_to_vertices: bool = True
+    snap_to_edges: bool = True
+    snap_to_entities: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plane": self.plane.to_dict(),
+            "entities": [entity.to_dict() for entity in self.entities],
+            "selected_entity_id": self.selected_entity_id,
+            "grid_size": self.grid_size,
+            "snap_to_grid": self.snap_to_grid,
+            "snap_to_vertices": self.snap_to_vertices,
+            "snap_to_edges": self.snap_to_edges,
+            "snap_to_entities": self.snap_to_entities,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SketchDocument":
+        return cls(
+            plane=SketchPlane.from_dict(payload["plane"]),
+            entities=[
+                SketchEntity.from_dict(item)
+                for item in payload.get("entities", [])
+            ],
+            selected_entity_id=payload.get("selected_entity_id"),
+            grid_size=float(payload.get("grid_size", 0.1)),
+            snap_to_grid=bool(payload.get("snap_to_grid", True)),
+            snap_to_vertices=bool(payload.get("snap_to_vertices", True)),
+            snap_to_edges=bool(payload.get("snap_to_edges", True)),
+            snap_to_entities=bool(payload.get("snap_to_entities", True)),
+        )
+
+
+@dataclass(slots=True)
 class MeshModel:
     vertices: np.ndarray
     faces: np.ndarray
     normals: np.ndarray
     face_colours: dict[int, Color] = field(default_factory=dict)
     overlay_strokes: list[Stroke] = field(default_factory=list)
+    legacy_overlay_strokes: list[Stroke] = field(default_factory=list)
+    sketch_documents: list[SketchDocument] = field(default_factory=list)
+    masked_faces: set[int] = field(default_factory=set)
+    interaction_mode: str = "paint"
     default_colour: Color = DEFAULT_COLOR
     source_path: str | None = None
     _adjacency: dict[int, set[int]] | None = field(default=None, init=False, repr=False)
+    _mesh_cache: trimesh.Trimesh | None = field(default=None, init=False, repr=False)
+    _face_centers: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.vertices = np.asarray(self.vertices, dtype=np.float32)
         self.faces = np.asarray(self.faces, dtype=np.int32)
         self.normals = np.asarray(self.normals, dtype=np.float32)
         self.face_colours = {int(face_id): clamp_color(colour) for face_id, colour in self.face_colours.items()}
+        self.masked_faces = {int(face_id) for face_id in self.masked_faces}
         self.default_colour = clamp_color(self.default_colour)
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError(f"Expected vertices shaped (n, 3), got {self.vertices.shape}")
@@ -79,7 +176,13 @@ class MeshModel:
         return int(self.vertices.shape[0])
 
     def mesh(self) -> trimesh.Trimesh:
-        return trimesh.Trimesh(vertices=self.vertices.copy(), faces=self.faces.copy(), process=False)
+        if self._mesh_cache is None:
+            self._mesh_cache = trimesh.Trimesh(
+                vertices=self.vertices.copy(),
+                faces=self.faces.copy(),
+                process=False,
+            )
+        return self._mesh_cache.copy()
 
     def face_colour(self, face_id: int) -> Color:
         return self.face_colours.get(int(face_id), self.default_colour)
@@ -106,6 +209,20 @@ class MeshModel:
         self._adjacency = adjacency
         return adjacency
 
+    def face_vertices(self, face_id: int) -> np.ndarray:
+        return self.vertices[self.faces[int(face_id)]]
+
+    def face_center(self, face_id: int) -> np.ndarray:
+        if self._face_centers is None:
+            self._face_centers = self.vertices[self.faces].mean(axis=1).astype(np.float32)
+        return self._face_centers[int(face_id)]
+
+    def mesh_extents(self) -> np.ndarray:
+        return (self.vertices.max(axis=0) - self.vertices.min(axis=0)).astype(np.float32)
+
+    def mesh_diagonal(self) -> float:
+        return float(np.linalg.norm(self.mesh_extents()))
+
     def to_project_dict(self) -> dict[str, Any]:
         return {
             "vertices": self.vertices.tolist(),
@@ -117,6 +234,16 @@ class MeshModel:
                 {"kind": stroke.kind, "data": stroke.data, "camera_matrix": stroke.camera_matrix.tolist()}
                 for stroke in self.overlay_strokes
             ],
+            "legacy_overlay_strokes": [
+                {"kind": stroke.kind, "data": stroke.data, "camera_matrix": stroke.camera_matrix.tolist()}
+                for stroke in self.legacy_overlay_strokes
+            ],
+            "sketch_documents": [
+                document.to_dict() for document in self.sketch_documents
+            ],
+            "masked_faces": sorted(self.masked_faces),
+            "interaction_mode": self.interaction_mode,
+            "command_history_version": 1,
             "source_path": self.source_path,
         }
 
@@ -132,6 +259,21 @@ class MeshModel:
             normals=np.asarray(payload["normals"], dtype=np.float32),
             face_colours={int(face_id): tuple(colour) for face_id, colour in payload.get("face_colours", {}).items()},
             default_colour=tuple(payload.get("default_colour", DEFAULT_COLOR)),
-            overlay_strokes=overlay_strokes,
+            overlay_strokes=[],
+            legacy_overlay_strokes=overlay_strokes
+            + [
+                Stroke(
+                    kind=item["kind"],
+                    data=item["data"],
+                    camera_matrix=np.asarray(item["camera_matrix"], dtype=np.float32),
+                )
+                for item in payload.get("legacy_overlay_strokes", [])
+            ],
+            sketch_documents=[
+                SketchDocument.from_dict(item)
+                for item in payload.get("sketch_documents", [])
+            ],
+            masked_faces=set(payload.get("masked_faces", [])),
+            interaction_mode=str(payload.get("interaction_mode", "paint")),
             source_path=payload.get("source_path"),
         )

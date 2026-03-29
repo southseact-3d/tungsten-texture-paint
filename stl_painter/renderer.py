@@ -273,6 +273,22 @@ class MeshRenderer:
         self._colour_vertices[start:end, 6:10] = base_colour
         self._mesh_vbo.write(self._colour_vertices.tobytes())
 
+    def update_face_colours(self, face_ids: list[int] | tuple[int, ...] | set[int]) -> None:
+        if not face_ids:
+            return
+        self._last_render_key = None
+        self._last_pick_image = None
+        if not self._gpu_ready or self._colour_vertices is None or self._mesh_vbo is None:
+            return
+        for face_id in face_ids:
+            base_colour = np.array(
+                self.mesh_model.face_colour(face_id), dtype=np.float32
+            ) / 255.0
+            start = face_id * 3
+            end = start + 3
+            self._colour_vertices[start:end, 6:10] = base_colour
+        self._mesh_vbo.write(self._colour_vertices.tobytes())
+
     def _camera_key(self, camera: OrbitCamera) -> tuple[tuple[int, int], bytes]:
         return self.viewport_size, camera.mvp_matrix(self.viewport_size).astype("f4").tobytes()
 

@@ -69,11 +69,14 @@ class MeshRenderer:
         self._last_pick_image: np.ndarray | None = None
         self._gpu_ready = False
         self._mesh_program: moderngl.Program | None = None
+        self._edge_program: moderngl.Program | None = None
         self._pick_program: moderngl.Program | None = None
         self._mesh_vbo: moderngl.Buffer | None = None
+        self._edge_vbo: moderngl.Buffer | None = None
         self._position_vbo: moderngl.Buffer | None = None
         self._face_id_vbo: moderngl.Buffer | None = None
         self._mesh_vao: moderngl.VertexArray | None = None
+        self._edge_vao: moderngl.VertexArray | None = None
         self._pick_vao: moderngl.VertexArray | None = None
         self._colour_fbo: moderngl.Framebuffer | None = None
         self._pick_fbo: moderngl.Framebuffer | None = None
@@ -144,6 +147,10 @@ class MeshRenderer:
                 vertex_shader=self._shader_source("mesh.vert"),
                 fragment_shader=self._shader_source("mesh.frag"),
             )
+            self._edge_program = self.ctx.program(
+                vertex_shader=self._shader_source("edge.vert"),
+                fragment_shader=self._shader_source("edge.frag"),
+            )
             self._pick_program = self.ctx.program(
                 vertex_shader=self._shader_source("pick.vert"),
                 fragment_shader=self._shader_source("pick.frag"),
@@ -152,6 +159,7 @@ class MeshRenderer:
             positions = self.mesh_model.vertices[self.mesh_model.faces].reshape(-1, 3).astype(
                 "f4"
             )
+            face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
             normals = np.repeat(self.mesh_model.normals, 3, axis=0).astype("f4")
             colours = np.repeat(
                 np.array(
@@ -173,6 +181,18 @@ class MeshRenderer:
                 [positions, normals, colours], axis=1
             ).astype("f4")
             self._mesh_vbo = self.ctx.buffer(self._colour_vertices.tobytes())
+            edge_positions = np.stack(
+                [
+                    face_vertices[:, 0],
+                    face_vertices[:, 1],
+                    face_vertices[:, 1],
+                    face_vertices[:, 2],
+                    face_vertices[:, 2],
+                    face_vertices[:, 0],
+                ],
+                axis=1,
+            ).reshape(-1, 3)
+            self._edge_vbo = self.ctx.buffer(edge_positions.astype("f4").tobytes())
             self._position_vbo = self.ctx.buffer(positions.tobytes())
             self._face_id_vbo = self.ctx.buffer(face_ids.tobytes())
             self._mesh_vao = self.ctx.vertex_array(
@@ -186,6 +206,10 @@ class MeshRenderer:
                         "in_colour",
                     )
                 ],
+            )
+            self._edge_vao = self.ctx.vertex_array(
+                self._edge_program,
+                [(self._edge_vbo, "3f", "in_position")],
             )
             self._pick_vao = self.ctx.vertex_array(
                 self._pick_program,
@@ -259,15 +283,17 @@ class MeshRenderer:
         self,
         camera: OrbitCamera,
         light_dir: tuple[float, float, float] = (0.3, 0.8, 0.4),
+        show_triangle_edges: bool = False,
     ) -> RenderSnapshot:
         if self._gpu_ready:
-            return self._render_gpu(camera, light_dir)
-        return self._render_software(camera, light_dir)
+            return self._render_gpu(camera, light_dir, show_triangle_edges)
+        return self._render_software(camera, light_dir, show_triangle_edges)
 
     def _render_gpu(
         self,
         camera: OrbitCamera,
         light_dir: tuple[float, float, float],
+        show_triangle_edges: bool,
     ) -> RenderSnapshot:
         assert self._gpu_ready
         assert isinstance(self.ctx, moderngl.Context)
@@ -284,6 +310,14 @@ class MeshRenderer:
         self._mesh_program["mvp"].write(self._mvp_bytes(camera))
         self._mesh_program["light_dir"].value = tuple(float(v) for v in light_dir)
         self._mesh_vao.render(mode=moderngl.TRIANGLES)
+        if show_triangle_edges:
+            assert self._edge_program is not None
+            assert self._edge_vao is not None
+            self.ctx.disable(moderngl.CULL_FACE)
+            self._edge_program["mvp"].write(self._mvp_bytes(camera))
+            self._edge_program["depth_bias"].value = 0.0006
+            self._edge_program["line_colour"].value = (0.0, 0.0, 0.0, 1.0)
+            self._edge_vao.render(mode=moderngl.LINES)
         rgba = np.frombuffer(
             self._colour_fbo.read(components=4, alignment=1), dtype=np.uint8
         ).reshape((self.viewport_size[1], self.viewport_size[0], 4))
@@ -419,6 +453,7 @@ class MeshRenderer:
         self,
         camera: OrbitCamera,
         light_dir: tuple[float, float, float] = (0.3, 0.8, 0.4),
+        show_triangle_edges: bool = False,
     ) -> RenderSnapshot:
         render_size = self._render_size()
         projected, order = self._sorted_face_indices(camera, render_size, min_area=1.25)
@@ -443,6 +478,12 @@ class MeshRenderer:
             draw.polygon(
                 points, fill=(int(lit[0]), int(lit[1]), int(lit[2]), int(base[3]))
             )
+            if show_triangle_edges:
+                draw.line(
+                    points + [points[0]],
+                    fill=(0, 0, 0, 255),
+                    width=1,
+                )
 
         if render_size != self.viewport_size:
             image = image.resize(self.viewport_size, Image.Resampling.BILINEAR)

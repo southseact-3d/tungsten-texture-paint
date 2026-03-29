@@ -42,6 +42,7 @@ class _RECT(ctypes.Structure):
 ToolMode = Literal["paint", "fill", "sketch"]
 SketchPrimitive = Literal["text", "rect", "line", "freehand"]
 NavAxis = Literal["xp", "xn", "yp", "yn", "zp", "zn"]
+WorkspaceMode = Literal["preview", "paint"]
 
 # Light and dark theme colors
 LIGHT_BG_COLOR = (0.95, 0.95, 0.95, 1.0)  # Light gray
@@ -65,6 +66,7 @@ class AppState:
     renderer: MeshRenderer | None = None
     paint_tool: PaintTool | None = None
     sketch_tool: SketchTool | None = None
+    workspace_mode: WorkspaceMode = "preview"
     tool_mode: ToolMode = "paint"
     sketch_primitive: SketchPrimitive = "text"
     active_colour: Color = PALETTE[1]
@@ -96,6 +98,7 @@ class TexturePainterApp:
 
     def _create_ui(self) -> None:
         dpg.create_context()
+        self._apply_light_theme()
         with dpg.texture_registry(show=False):
             dpg.add_raw_texture(
                 width=self.state.viewport_size[0],
@@ -151,9 +154,15 @@ class TexturePainterApp:
                 )
                 dpg.add_button(label="Bake Sketch", callback=self._on_bake_sketch)
                 dpg.add_button(label="Undo", callback=self._on_undo)
+                dpg.add_text("Preview Mode", tag="workspace_mode_label")
                 dpg.add_text("", tag="status_text")
+            dpg.add_text(
+                "Preview mode: orbit the model here. Press Tab to switch into texture paint mode.",
+                tag="workspace_hint_text",
+                wrap=0,
+            )
             with dpg.group(horizontal=True):
-                with dpg.child_window(width=280, autosize_y=True):
+                with dpg.child_window(width=280, autosize_y=True, tag="tools_panel"):
                     dpg.add_text("Tools")
                     dpg.add_radio_button(
                         items=["paint", "fill", "sketch"],
@@ -239,7 +248,68 @@ class TexturePainterApp:
         dpg.set_viewport_clear_color([242, 242, 242, 255])
         dpg.show_viewport()
         dpg.set_primary_window("main_window", True)
+        self._sync_workspace_ui()
         self._draw_nav_pad()
+
+    def _apply_light_theme(self) -> None:
+        with dpg.theme() as light_theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (246, 246, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (252, 252, 252, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_PopupBg, (255, 255, 255, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (235, 238, 242, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (222, 228, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (210, 220, 230, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (223, 228, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (204, 214, 226, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (187, 200, 214, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (224, 232, 240, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (208, 220, 232, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (194, 209, 224, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBg, (238, 241, 245, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (229, 235, 242, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (49, 91, 153, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (85, 119, 173, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (64, 96, 145, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (32, 36, 42, 255))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 8)
+                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 8)
+        dpg.bind_theme(light_theme)
+
+    def _sync_workspace_ui(self) -> None:
+        in_paint_mode = self.state.workspace_mode == "paint"
+        if dpg.does_item_exist("tools_panel"):
+            dpg.configure_item("tools_panel", show=in_paint_mode)
+        if dpg.does_item_exist("workspace_mode_label"):
+            dpg.set_value(
+                "workspace_mode_label",
+                "Texture Paint Mode" if in_paint_mode else "Preview Mode",
+            )
+        if dpg.does_item_exist("workspace_hint_text"):
+            hint = (
+                "Texture paint mode: paint, fill, and sketch on the model. Press Tab to return to preview mode."
+                if in_paint_mode
+                else "Preview mode: orbit the model here. Press Tab to switch into texture paint mode."
+            )
+            dpg.set_value("workspace_hint_text", hint)
+
+    def _set_workspace_mode(self, mode: WorkspaceMode) -> None:
+        if self.state.workspace_mode == mode:
+            return
+        self.state.workspace_mode = mode
+        self._sync_workspace_ui()
+        self._mark_viewport_dirty()
+        if mode == "paint":
+            self._set_status("Texture paint mode enabled")
+        else:
+            self._set_status("Preview mode enabled")
+
+    def _toggle_workspace_mode(self) -> None:
+        next_mode: WorkspaceMode = (
+            "paint" if self.state.workspace_mode == "preview" else "preview"
+        )
+        self._set_workspace_mode(next_mode)
 
     def _select_palette_colour(self, index: int) -> None:
         self.state.active_colour = PALETTE[index]
@@ -631,7 +701,7 @@ class TexturePainterApp:
         self.state.viewport_size = viewport_size
         self._mark_viewport_dirty()
         self._set_status(
-            f"Loaded mesh with {mesh_model.face_count} faces from {Path(mesh_model.source_path or 'project').name}"
+            f"Loaded mesh with {mesh_model.face_count} faces from {Path(mesh_model.source_path or 'project').name} | Preview mode active, press Tab to paint"
         )
 
     def _viewport_size(self) -> tuple[int, int]:
@@ -656,7 +726,10 @@ class TexturePainterApp:
         ):
             # Show a software grid when no model is loaded to avoid a black viewport.
             return make_grid_snapshot(self.state.viewport_size)
-        return self.state.renderer.render(self.state.camera)
+        return self.state.renderer.render(
+            self.state.camera,
+            show_triangle_edges=self.state.workspace_mode == "paint",
+        )
 
     def _render_viewport(self) -> None:
         if not self.state.viewport_dirty:
@@ -796,6 +869,8 @@ class TexturePainterApp:
         self.state.dragging = True
         self.state.drag_button = button
         self.state.drag_origin = mouse_pos
+        if self.state.workspace_mode == "preview":
+            return
         if button == 0:
             if self.state.tool_mode == "sketch":
                 if self.state.sketch_primitive == "text":
@@ -827,6 +902,7 @@ class TexturePainterApp:
         mouse_pos = self._viewport_mouse_position()
         if (
             button == 0
+            and self.state.workspace_mode == "paint"
             and self.state.tool_mode == "sketch"
             and self.state.mesh_model
             and self.state.camera
@@ -906,7 +982,9 @@ class TexturePainterApp:
         ):
             dx = mouse_pos[0] - self.state.drag_origin[0]
             dy = mouse_pos[1] - self.state.drag_origin[1]
-            if self.state.drag_button == 1:
+            if self.state.drag_button == 1 or (
+                self.state.workspace_mode == "preview" and self.state.drag_button == 0
+            ):
                 self.state.camera.orbit(dx * 0.4, -dy * 0.4)
                 self.state.drag_origin = mouse_pos
                 self._mark_viewport_dirty()
@@ -914,11 +992,17 @@ class TexturePainterApp:
                 self.state.camera.pan(dx, dy)
                 self.state.drag_origin = mouse_pos
                 self._mark_viewport_dirty()
-            elif self.state.drag_button == 0 and self.state.tool_mode == "paint":
+            elif (
+                self.state.workspace_mode == "paint"
+                and self.state.drag_button == 0
+                and self.state.tool_mode == "paint"
+            ):
                 face_id = self._pick_face(mouse_pos)
                 if face_id is not None:
                     self._apply_paint(face_id)
             elif (
+                self.state.workspace_mode == "paint"
+                and
                 self.state.drag_button == 0
                 and self.state.tool_mode == "sketch"
                 and self.state.sketch_primitive == "freehand"
@@ -939,6 +1023,9 @@ class TexturePainterApp:
             self.state.shift_down = True
         if app_data in (341, 345):
             self.state.ctrl_down = True
+        if app_data == getattr(dpg, "mvKey_Tab", 258):
+            self._toggle_workspace_mode()
+            return
         if self.state.ctrl_down and app_data == 90:
             self._on_undo()
 

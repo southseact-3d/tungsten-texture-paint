@@ -9,7 +9,7 @@ from .color_utils import Color
 
 InteractionMode = Literal["paint", "sketch"]
 PaintMode = Literal["brush", "fill", "sample", "erase", "mask"]
-SketchMode = Literal["select", "line", "rect", "circle", "text", "trim"]
+SketchMode = Literal["select", "line", "rect", "circle", "text"]
 
 
 @dataclass(slots=True)

@@ -8,6 +8,8 @@ import trimesh
 
 from .color_utils import DEFAULT_COLOR, Color, clamp_color
 
+PROJECT_VERSION = 2
+
 
 @dataclass(slots=True)
 class Stroke:
@@ -225,6 +227,7 @@ class MeshModel:
 
     def to_project_dict(self) -> dict[str, Any]:
         return {
+            "project_version": PROJECT_VERSION,
             "vertices": self.vertices.tolist(),
             "faces": self.faces.tolist(),
             "normals": self.normals.tolist(),
@@ -243,7 +246,6 @@ class MeshModel:
             ],
             "masked_faces": sorted(self.masked_faces),
             "interaction_mode": self.interaction_mode,
-            "command_history_version": 1,
             "source_path": self.source_path,
         }
 

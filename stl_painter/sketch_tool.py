@@ -184,6 +184,7 @@ class SketchTool:
         *,
         text: str = "Text",
         stroke_width: float = 0.02,
+        text_size: int = 28,
     ) -> SketchEntity:
         data: dict[str, object]
         if kind == "rect":
@@ -215,7 +216,7 @@ class SketchTool:
                 "position": start_uv.tolist(),
                 "text": text,
                 "colour": list(colour),
-                "size": 28,
+                "size": int(text_size),
             }
         else:
             data = {
@@ -263,8 +264,9 @@ class SketchTool:
         pixels_per_unit: float,
     ) -> None:
         draw = ImageDraw.Draw(image)
+        text_size = int(entity.data.get("size", 28))
         if self._font_path:
-            font = ImageFont.truetype(self._font_path, size=28)
+            font = ImageFont.truetype(self._font_path, size=max(8, text_size))
         else:
             font = ImageFont.load_default()
         def to_px(uv: np.ndarray) -> tuple[float, float]:
@@ -272,6 +274,7 @@ class SketchTool:
             y = (bounds[3] - float(uv[1])) * pixels_per_unit
             return x, y
         colour = tuple(int(value) for value in entity.data.get("colour", [255, 0, 0, 255]))
+        stroke_width = max(1, int(round(float(entity.data.get("stroke_width", 0.02)) * pixels_per_unit)))
         if entity.kind == "rect":
             min_uv = np.asarray(entity.data["min"], dtype=np.float32)
             max_uv = np.asarray(entity.data["max"], dtype=np.float32)
@@ -283,12 +286,12 @@ class SketchTool:
                     (max(p0[0], p1[0]), max(p0[1], p1[1])),
                 ],
                 outline=colour,
-                width=3,
+                width=stroke_width,
             )
         elif entity.kind == "line":
             start_uv = np.asarray(entity.data["start"], dtype=np.float32)
             end_uv = np.asarray(entity.data["end"], dtype=np.float32)
-            draw.line([to_px(start_uv), to_px(end_uv)], fill=colour, width=3)
+            draw.line([to_px(start_uv), to_px(end_uv)], fill=colour, width=stroke_width)
         elif entity.kind == "circle":
             center = np.asarray(entity.data["center"], dtype=np.float32)
             radius = float(entity.data["radius"])
@@ -302,7 +305,7 @@ class SketchTool:
                     (max(p0[0], p1[0]), max(p0[1], p1[1])),
                 ],
                 outline=colour,
-                width=3,
+                width=stroke_width,
             )
         elif entity.kind == "text":
             position = np.asarray(entity.data["position"], dtype=np.float32)

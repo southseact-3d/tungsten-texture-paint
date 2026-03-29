@@ -35,3 +35,17 @@ def test_command_history_sketch_entity(square_mesh) -> None:
 
     commands.undo()
     assert document.entities == []
+
+
+def test_command_history_mask_set_undo_redo(square_mesh) -> None:
+    commands = AppCommands(square_mesh, PaintTool(square_mesh))
+
+    touched = commands.set_masked_faces({0}, description="Mask one face")
+    assert touched == [0]
+    assert square_mesh.masked_faces == {0}
+
+    commands.undo()
+    assert square_mesh.masked_faces == set()
+
+    commands.redo()
+    assert square_mesh.masked_faces == {0}

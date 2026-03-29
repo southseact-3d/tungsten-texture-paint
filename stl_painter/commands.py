@@ -110,6 +110,26 @@ class DeleteSketchEntityCommand:
         return []
 
 
+@dataclass(slots=True)
+class SetMaskedFacesCommand:
+    mesh_model: MeshModel
+    new_masked_faces: set[int]
+    _previous_masked_faces: set[int] = field(default_factory=set)
+    description: str = "Update masked faces"
+
+    def apply(self) -> list[int]:
+        self._previous_masked_faces = set(self.mesh_model.masked_faces)
+        self.mesh_model.masked_faces = {int(face_id) for face_id in self.new_masked_faces}
+        touched = self._previous_masked_faces.union(self.mesh_model.masked_faces)
+        return sorted(touched)
+
+    def undo(self) -> list[int]:
+        current = set(self.mesh_model.masked_faces)
+        self.mesh_model.masked_faces = set(self._previous_masked_faces)
+        touched = current.union(self.mesh_model.masked_faces)
+        return sorted(touched)
+
+
 class CommandManager:
     def __init__(self) -> None:
         self._undo_stack: list[Command] = []
@@ -174,6 +194,21 @@ class AppCommands:
 
     def delete_sketch_entity(self, document: SketchDocument, entity_id: str) -> list[int]:
         return self.history.execute(DeleteSketchEntityCommand(document=document, entity_id=entity_id))
+
+    def set_masked_faces(
+        self,
+        face_ids: set[int],
+        description: str = "Update masked faces",
+    ) -> list[int]:
+        if self.mesh_model is None:
+            return []
+        return self.history.execute(
+            SetMaskedFacesCommand(
+                mesh_model=self.mesh_model,
+                new_masked_faces={int(face_id) for face_id in face_ids},
+                description=description,
+            )
+        )
 
     def undo(self) -> list[int]:
         return self.history.undo()

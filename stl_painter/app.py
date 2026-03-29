@@ -192,17 +192,28 @@ class TexturePainterApp:
                     default_value=self.state.brush.angle_tolerance_degrees,
                     callback=lambda _s, value: setattr(self.state.brush, "angle_tolerance_degrees", float(value)),
                 )
+                dpg.add_button(label="Clear Mask", callback=self._on_clear_mask)
+                dpg.add_button(label="Invert Mask", callback=self._on_invert_mask)
+                dpg.add_text("Masked faces: 0", tag="mask_count_text")
             with dpg.group(tag="sketch_section", show=False):
                 dpg.add_separator()
                 dpg.add_text("Sketch")
                 dpg.add_combo(
-                    items=["select", "line", "rect", "circle", "text", "trim"],
+                    items=["select", "line", "rect", "circle", "text"],
                     default_value=self.state.sketch_tool,
                     label="Tool",
                     callback=self._set_sketch_tool,
                     tag="sketch_tool_combo",
                 )
                 dpg.add_input_text(label="Text", default_value="Text", tag="sketch_text_value")
+                dpg.add_slider_int(label="Text Size", min_value=8, max_value=120, default_value=28, tag="sketch_text_size")
+                dpg.add_slider_float(
+                    label="Stroke Width",
+                    min_value=0.001,
+                    max_value=0.2,
+                    default_value=0.02,
+                    tag="sketch_stroke_width",
+                )
                 dpg.add_slider_float(label="Grid", min_value=0.01, max_value=1.0, default_value=0.1, callback=self._set_sketch_grid)
                 dpg.add_checkbox(label="Snap To Grid", default_value=True, callback=self._set_snap_flag, user_data="grid")
                 dpg.add_checkbox(label="Snap To Vertices", default_value=True, callback=self._set_snap_flag, user_data="vertices")
@@ -312,6 +323,7 @@ class TexturePainterApp:
             "mesh_info_text",
             f"{Path(mesh_model.source_path or 'project').name}\nFaces: {mesh_model.face_count}\nVertices: {mesh_model.vertex_count}\nMasked: {len(mesh_model.masked_faces)}",
         )
+        self._refresh_mask_count()
         self._set_status(f"Loaded {Path(mesh_model.source_path or 'project').name}")
 
     def _render_snapshot(self) -> RenderSnapshot:
@@ -357,8 +369,22 @@ class TexturePainterApp:
         document = self._active_document()
         if document is None:
             return
-        for entity in document.entities:
+        preview_entity = None
+        if self.state.dragging and self.state.interaction_mode == "sketch" and self.state.sketch_tool in {"rect", "line", "circle"} and self.state.drag_origin_plane is not None:
+            current_uv = self._screen_hit_on_plane(self._viewport_mouse_position())
+            if current_uv is not None:
+                preview_entity = self.sketch_tool.create_entity(
+                    self.state.sketch_tool,
+                    self.state.drag_origin_plane,
+                    current_uv,
+                    self.state.active_colour,
+                    text=str(dpg.get_value("sketch_text_value")),
+                    stroke_width=float(dpg.get_value("sketch_stroke_width")),
+                    text_size=int(dpg.get_value("sketch_text_size")),
+                )
+        for entity in document.entities + ([preview_entity] if preview_entity is not None else []):
             colour = np.array(entity.data.get("colour", [255, 80, 80, 255]), dtype=np.float32)[:3] / 255.0
+            alpha = 0.45 if preview_entity is not None and entity.entity_id == preview_entity.entity_id else 1.0
             if entity.kind == "rect":
                 min_uv = np.asarray(entity.data["min"], dtype=np.float32)
                 max_uv = np.asarray(entity.data["max"], dtype=np.float32)
@@ -371,14 +397,14 @@ class TexturePainterApp:
                 screens = [self._project_world_to_screen(self.sketch_tool.plane_to_world(document.plane, uv)) for uv in corners]
                 if all(screen is not None for screen in screens):
                     for index in range(4):
-                        self._draw_line(rgba, screens[index], screens[(index + 1) % 4], tuple(colour))  # type: ignore[arg-type]
+                        self._draw_line(rgba, screens[index], screens[(index + 1) % 4], tuple(colour), alpha=alpha)  # type: ignore[arg-type]
             elif entity.kind == "line":
                 start = self.sketch_tool.plane_to_world(document.plane, np.asarray(entity.data["start"], dtype=np.float32))
                 end = self.sketch_tool.plane_to_world(document.plane, np.asarray(entity.data["end"], dtype=np.float32))
                 p0 = self._project_world_to_screen(start)
                 p1 = self._project_world_to_screen(end)
                 if p0 and p1:
-                    self._draw_line(rgba, p0, p1, tuple(colour))
+                    self._draw_line(rgba, p0, p1, tuple(colour), alpha=alpha)
             elif entity.kind == "circle":
                 center = np.asarray(entity.data["center"], dtype=np.float32)
                 radius = float(entity.data["radius"])
@@ -393,7 +419,7 @@ class TexturePainterApp:
                 valid = [screen for screen in screens if screen is not None]
                 if len(valid) >= 2:
                     for index in range(len(valid)):
-                        self._draw_line(rgba, valid[index], valid[(index + 1) % len(valid)], tuple(colour))
+                        self._draw_line(rgba, valid[index], valid[(index + 1) % len(valid)], tuple(colour), alpha=alpha)
             elif entity.kind == "text":
                 point = self.sketch_tool.plane_to_world(document.plane, np.asarray(entity.data["position"], dtype=np.float32))
                 screen = self._project_world_to_screen(point)
@@ -456,11 +482,14 @@ class TexturePainterApp:
             self._set_status(f"Sampled face {pick.face_id}")
             return
         if tool == "mask":
-            if pick.face_id in self.mesh_model.masked_faces:
-                self.mesh_model.masked_faces.remove(pick.face_id)
+            updated = set(self.mesh_model.masked_faces)
+            if pick.face_id in updated:
+                updated.remove(pick.face_id)
             else:
-                self.mesh_model.masked_faces.add(pick.face_id)
-            self._mark_viewport_dirty()
+                updated.add(pick.face_id)
+            touched = self.commands.set_masked_faces(updated, description="Toggle face mask")
+            self._apply_updates(touched)
+            self._refresh_mask_count()
             return
         if tool == "fill":
             updates = self.paint_tool.flood_fill_updates(pick.face_id, self.state.active_colour)
@@ -566,6 +595,7 @@ class TexturePainterApp:
                 start_uv,
                 self.state.active_colour,
                 text=str(dpg.get_value("sketch_text_value")),
+                text_size=int(dpg.get_value("sketch_text_size")),
             )
             self.commands.add_sketch_entity(self._active_document(), entity)
             self._mark_viewport_dirty()
@@ -586,6 +616,8 @@ class TexturePainterApp:
                         end_uv,
                         self.state.active_colour,
                         text=str(dpg.get_value("sketch_text_value")),
+                        stroke_width=float(dpg.get_value("sketch_stroke_width")),
+                        text_size=int(dpg.get_value("sketch_text_size")),
                     )
                     self.commands.add_sketch_entity(document, entity)
                     self._mark_viewport_dirty()
@@ -685,12 +717,38 @@ class TexturePainterApp:
     def _on_undo(self, _sender: int | None = None, _app_data: object | None = None) -> None:
         touched = self.commands.undo()
         self._apply_updates(touched)
+        self._refresh_mask_count()
         self._set_status("Undo")
 
     def _on_redo(self, _sender: int | None = None, _app_data: object | None = None) -> None:
         touched = self.commands.redo()
         self._apply_updates(touched)
+        self._refresh_mask_count()
         self._set_status("Redo")
+
+    def _refresh_mask_count(self) -> None:
+        if self.mesh_model is None:
+            dpg.set_value("mask_count_text", "Masked faces: 0")
+            return
+        dpg.set_value("mask_count_text", f"Masked faces: {len(self.mesh_model.masked_faces)}")
+
+    def _on_clear_mask(self) -> None:
+        if self.mesh_model is None or not self.mesh_model.masked_faces:
+            return
+        touched = self.commands.set_masked_faces(set(), description="Clear mask")
+        self._apply_updates(touched)
+        self._refresh_mask_count()
+        self._set_status("Cleared mask")
+
+    def _on_invert_mask(self) -> None:
+        if self.mesh_model is None:
+            return
+        full_set = set(range(self.mesh_model.face_count))
+        updated = full_set.difference(self.mesh_model.masked_faces)
+        touched = self.commands.set_masked_faces(updated, description="Invert mask")
+        self._apply_updates(touched)
+        self._refresh_mask_count()
+        self._set_status("Inverted mask")
 
     def _capture_viewport_to_file(self) -> Path:
         self._render_viewport()

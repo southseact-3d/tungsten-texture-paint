@@ -37,6 +37,23 @@ PALETTE: list[Color] = [
     (157, 78, 221, 255),
 ]
 
+ICON = {
+    "open": "📂",
+    "export": "📤",
+    "save": "💾",
+    "bake": "🔥",
+    "undo": "↶",
+    "redo": "↷",
+    "clear": "🧹",
+    "invert": "🔁",
+    "paint": "🖌",
+    "mask": "🎭",
+    "select": "🔲",
+    "image": "🖼",
+    "send": "✉",
+    "svg": "📐",
+}
+
 
 def _normalise_picker_colour(app_data: list[float] | tuple[float, ...]) -> Color:
     if not app_data:
@@ -108,6 +125,8 @@ class TexturePainterApp:
 
     def _create_ui(self) -> None:
         dpg.create_context()
+        self._apply_light_theme()
+        self._load_default_font()
         with dpg.texture_registry(show=False):
             dpg.add_raw_texture(
                 width=self.state.viewport_size[0],
@@ -119,13 +138,14 @@ class TexturePainterApp:
         self._create_file_dialogs()
         with dpg.window(label="STL Texture Painter", tag="main_window"):
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Open STL / Project", callback=lambda: dpg.show_item("open_dialog"))
-                dpg.add_button(label="Export 3MF", callback=lambda: dpg.show_item("export_dialog"))
-                dpg.add_button(label="Save Project", callback=lambda: dpg.show_item("save_project_dialog"))
-                dpg.add_button(label="Bake Sketch", callback=self._on_bake_sketch)
-                dpg.add_button(label="Undo", callback=self._on_undo)
-                dpg.add_button(label="Redo", callback=self._on_redo)
+                dpg.add_button(label=f"{ICON['open']} Open STL / Project", callback=lambda: dpg.show_item("open_dialog"), width=180)
+                dpg.add_button(label=f"{ICON['export']} Export 3MF", callback=lambda: dpg.show_item("export_dialog"), width=130)
+                dpg.add_button(label=f"{ICON['save']} Save Project", callback=lambda: dpg.show_item("save_project_dialog"), width=140)
+                dpg.add_button(label=f"{ICON['bake']} Bake Sketch", callback=self._on_bake_sketch, width=130)
+                dpg.add_button(label=f"{ICON['undo']} Undo", callback=self._on_undo, width=90)
+                dpg.add_button(label=f"{ICON['redo']} Redo", callback=self._on_redo, width=90)
                 dpg.add_text("", tag="status_text")
+            dpg.add_separator()
             with dpg.group(horizontal=True):
                 self._build_left_sidebar()
                 with dpg.child_window(autosize_x=True, autosize_y=True):
@@ -145,9 +165,47 @@ class TexturePainterApp:
         self._set_status("Ready")
         self._sync_tool_panels()
 
+    def _apply_light_theme(self) -> None:
+        with dpg.theme(tag="light_app_theme"):
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 12)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 8)
+                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 8)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 6)
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (246, 248, 252, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (255, 255, 255, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_PopupBg, (255, 255, 255, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (240, 244, 250, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (229, 238, 250, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (217, 232, 252, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (64, 123, 255, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (48, 107, 232, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (38, 88, 204, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (219, 232, 255, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (204, 223, 252, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (186, 212, 252, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (31, 41, 55, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Separator, (206, 216, 230, 255))
+        dpg.bind_theme("light_app_theme")
+
+    def _load_default_font(self) -> None:
+        font_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ]
+        for font_path in font_candidates:
+            if Path(font_path).exists():
+                with dpg.font_registry():
+                    font_id = dpg.add_font(font_path, 17)
+                dpg.bind_font(font_id)
+                return
+
     def _build_left_sidebar(self) -> None:
         with dpg.child_window(width=300, autosize_y=True):
-            dpg.add_text("Mode")
+            dpg.add_text("Workspace", color=(33, 55, 102))
             dpg.add_combo(
                 items=["paint", "sketch"],
                 default_value=self.state.interaction_mode,
@@ -156,15 +214,16 @@ class TexturePainterApp:
                 tag="interaction_mode_combo",
             )
             dpg.add_separator()
-            dpg.add_text("Paint Colour")
+            dpg.add_text("Colour", color=(33, 55, 102))
             dpg.add_text("No mesh loaded", tag="mesh_info_text", wrap=260)
-            for index, colour in enumerate(PALETTE):
-                dpg.add_color_button(
-                    default_value=list(colour),
-                    width=36,
-                    height=24,
-                    callback=lambda _s, _a, user_data=index: self._select_palette_colour(user_data),
-                )
+            with dpg.group(horizontal=True):
+                for index, colour in enumerate(PALETTE):
+                    dpg.add_color_button(
+                        default_value=list(colour),
+                        width=40,
+                        height=30,
+                        callback=lambda _s, _a, user_data=index: self._select_palette_colour(user_data),
+                    )
             dpg.add_color_picker(
                 label="Active Color",
                 default_value=list(self.state.active_colour),
@@ -174,7 +233,7 @@ class TexturePainterApp:
             )
             with dpg.group(tag="paint_section"):
                 dpg.add_separator()
-                dpg.add_text("Paint")
+                dpg.add_text("Paint Tools", color=(33, 55, 102))
                 dpg.add_combo(
                     items=["brush", "fill", "sample", "erase", "mask", "select"],
                     default_value=self.state.paint_tool,
@@ -219,16 +278,16 @@ class TexturePainterApp:
                     default_value=self.state.brush.angle_tolerance_degrees,
                     callback=lambda _s, value: setattr(self.state.brush, "angle_tolerance_degrees", float(value)),
                 )
-                dpg.add_button(label="Clear Mask", callback=self._on_clear_mask)
-                dpg.add_button(label="Invert Mask", callback=self._on_invert_mask)
-                dpg.add_button(label="Paint Selected", callback=self._paint_selected_faces)
-                dpg.add_button(label="Mask Selected", callback=self._mask_selected_faces)
-                dpg.add_button(label="Clear Selection", callback=self._clear_face_selection)
+                dpg.add_button(label=f"{ICON['clear']} Clear Mask", callback=self._on_clear_mask, width=-1)
+                dpg.add_button(label=f"{ICON['invert']} Invert Mask", callback=self._on_invert_mask, width=-1)
+                dpg.add_button(label=f"{ICON['paint']} Paint Selected", callback=self._paint_selected_faces, width=-1)
+                dpg.add_button(label=f"{ICON['mask']} Mask Selected", callback=self._mask_selected_faces, width=-1)
+                dpg.add_button(label=f"{ICON['select']} Clear Selection", callback=self._clear_face_selection, width=-1)
                 dpg.add_text("Masked faces: 0", tag="mask_count_text")
                 dpg.add_text("Selected faces: 0", tag="selected_count_text")
             with dpg.group(tag="sketch_section", show=False):
                 dpg.add_separator()
-                dpg.add_text("Sketch")
+                dpg.add_text("Sketch Tools", color=(33, 55, 102))
                 dpg.add_combo(
                     items=["select", "line", "rect", "circle", "text", "svg"],
                     default_value=self.state.sketch_tool,
@@ -236,7 +295,7 @@ class TexturePainterApp:
                     callback=self._set_sketch_tool,
                     tag="sketch_tool_combo",
                 )
-                dpg.add_button(label="Import SVG", callback=lambda: dpg.show_item("svg_dialog"))
+                dpg.add_button(label=f"{ICON['svg']} Import SVG", callback=lambda: dpg.show_item("svg_dialog"), width=-1)
                 dpg.add_combo(items=self.state.recent_svgs or [""], label="Recent SVGs", tag="recent_svg_combo", callback=self._on_recent_svg_selected)
                 dpg.add_input_text(label="Text", default_value="Text", tag="sketch_text_value")
                 dpg.add_slider_int(label="Text Size", min_value=8, max_value=120, default_value=28, tag="sketch_text_size")
@@ -256,7 +315,7 @@ class TexturePainterApp:
 
     def _build_right_sidebar(self) -> None:
         with dpg.child_window(width=360, autosize_y=True):
-            dpg.add_text("AI Assistant")
+            dpg.add_text("AI Assistant", color=(33, 55, 102))
             dpg.add_input_text(
                 label="Base URL",
                 default_value=self.state.ai_settings.provider_base_url,
@@ -274,9 +333,9 @@ class TexturePainterApp:
                 callback=lambda _s, value: setattr(self.state.ai_settings, "model", value),
             )
             dpg.add_input_text(label="Image", default_value=self.state.ai_settings.image_path, tag="ai_image_path")
-            dpg.add_button(label="Choose Image", callback=lambda: dpg.show_item("image_dialog"))
+            dpg.add_button(label=f"{ICON['image']} Choose Image", callback=lambda: dpg.show_item("image_dialog"), width=-1)
             dpg.add_input_text(multiline=True, height=120, hint="Describe the paint or sketch you want...", tag="ai_prompt_input")
-            dpg.add_button(label="Send To Assistant", callback=self._on_ai_send)
+            dpg.add_button(label=f"{ICON['send']} Send To Assistant", callback=self._on_ai_send, width=-1)
             dpg.add_input_text(multiline=True, readonly=True, height=220, tag="ai_chat_transcript")
             dpg.add_input_text(multiline=True, readonly=True, height=180, tag="ai_tool_log")
 

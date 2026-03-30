@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from stl_painter.sketch_tool import SketchTool
-from stl_painter.project_io import load_project, save_project
+from stl_painter.project_io import PROJECT_EXTENSION, load_project, load_tg3d, save_project, save_tg3d
 
 
 def test_project_round_trip(tmp_path, square_mesh) -> None:
@@ -34,3 +34,16 @@ def test_load_project_migrates_legacy_payload_without_version(tmp_path, square_m
 
     loaded = load_project(path)
     assert loaded.face_count == square_mesh.face_count
+
+
+def test_tg3d_round_trip_with_timeline(tmp_path, square_mesh) -> None:
+    timeline = {
+        "current_index": 1,
+        "descriptions": ["Initial state", "Paint stroke"],
+        "snapshots": [square_mesh.to_project_dict(), square_mesh.to_project_dict()],
+    }
+    path = tmp_path / f"project{PROJECT_EXTENSION}"
+    save_tg3d(path, square_mesh, timeline=timeline)
+    loaded, loaded_timeline = load_tg3d(path)
+    assert loaded.face_count == square_mesh.face_count
+    assert int(loaded_timeline["current_index"]) == 1

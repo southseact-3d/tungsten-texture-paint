@@ -49,3 +49,15 @@ def test_command_history_mask_set_undo_redo(square_mesh) -> None:
 
     commands.redo()
     assert square_mesh.masked_faces == {0}
+
+
+def test_timeline_jump_and_export(square_mesh) -> None:
+    commands = AppCommands(square_mesh, PaintTool(square_mesh))
+    commands.paint_faces({0: (255, 0, 0, 255)}, description="First")
+    commands.paint_faces({1: (0, 255, 0, 255)}, description="Second")
+    commands.jump_to_timeline_index(1)
+    assert square_mesh.face_colour(0) == (255, 0, 0, 255)
+    assert square_mesh.face_colour(1) == square_mesh.default_colour
+    payload = commands.export_timeline()
+    assert payload["current_index"] == 1
+    assert len(payload["descriptions"]) == 3

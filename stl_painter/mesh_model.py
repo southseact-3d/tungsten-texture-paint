@@ -474,3 +474,77 @@ class MeshModel:
             },
             model_scale=float(payload.get("model_scale", 1.0)),
         )
+
+    def to_project_delta(
+        self, exclude_colors: set[tuple[int, int, int, int]] | None = None
+    ) -> dict[str, Any]:
+        if exclude_colors is None:
+            exclude_colors = set()
+        filtered_colors = {
+            str(face_id): list(colour)
+            for face_id, colour in self.face_colours.items()
+            if colour != self.default_colour
+            and colour not in exclude_colors
+            and not (colour[0] == colour[1] == colour[2] and colour[3] == 255)
+        }
+        return {
+            "face_colours": filtered_colors,
+            "default_colour": list(self.default_colour),
+            "overlay_strokes": [
+                {
+                    "kind": stroke.kind,
+                    "data": stroke.data,
+                    "camera_matrix": stroke.camera_matrix.tolist(),
+                }
+                for stroke in self.overlay_strokes
+            ],
+            "sketch_documents": [
+                document.to_dict() for document in self.sketch_documents
+            ],
+            "masked_faces": sorted(self.masked_faces),
+            "interaction_mode": self.interaction_mode,
+            "face_groups": {
+                group_id: list(faces) for group_id, faces in self.face_groups.items()
+            },
+            "face_to_group": {
+                str(face_id): group_id
+                for face_id, group_id in self.face_to_group.items()
+            },
+            "model_scale": self.model_scale,
+        }
+
+    @classmethod
+    def from_project_delta(
+        cls, base: "MeshModel", delta: dict[str, Any]
+    ) -> "MeshModel":
+        merged_colors = dict(base.face_colours)
+        delta_colors = delta.get("face_colours", {})
+        for face_id, colour in delta_colors.items():
+            merged_colors[int(face_id)] = tuple(colour)
+        overlay_strokes = [
+            Stroke(
+                kind=item["kind"],
+                data=item["data"],
+                camera_matrix=np.asarray(item["camera_matrix"], dtype=np.float32),
+            )
+            for item in delta.get("overlay_strokes", [])
+        ]
+        return cls(
+            vertices=base.vertices.copy(),
+            faces=base.faces.copy(),
+            normals=base.normals.copy(),
+            face_colours=merged_colors,
+            default_colour=tuple(delta.get("default_colour", base.default_colour)),
+            overlay_strokes=[],
+            legacy_overlay_strokes=overlay_strokes,
+            sketch_documents=[
+                SketchDocument.from_dict(item)
+                for item in delta.get("sketch_documents", [])
+            ],
+            masked_faces=set(delta.get("masked_faces", base.masked_faces)),
+            interaction_mode=str(delta.get("interaction_mode", base.interaction_mode)),
+            source_path=base.source_path,
+            face_groups=delta.get("face_groups", base.face_groups),
+            face_to_group=delta.get("face_to_group", base.face_to_group),
+            model_scale=float(delta.get("model_scale", base.model_scale)),
+        )

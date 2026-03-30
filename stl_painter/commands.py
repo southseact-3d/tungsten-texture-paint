@@ -132,36 +132,53 @@ class SetMaskedFacesCommand:
 
 class CommandManager:
     def __init__(self) -> None:
-        self._undo_stack: list[Command] = []
-        self._redo_stack: list[Command] = []
+        self._timeline: list[Command] = []
+        self._cursor: int = -1
 
     def execute(self, command: Command) -> list[int]:
+        if self._cursor + 1 < len(self._timeline):
+            self._timeline = self._timeline[: self._cursor + 1]
         touched = command.apply()
-        self._undo_stack.append(command)
-        self._redo_stack.clear()
+        self._timeline.append(command)
+        self._cursor = len(self._timeline) - 1
         return touched
 
     def undo(self) -> list[int]:
-        if not self._undo_stack:
+        if self._cursor < 0:
             return []
-        command = self._undo_stack.pop()
+        command = self._timeline[self._cursor]
         touched = command.undo()
-        self._redo_stack.append(command)
+        self._cursor -= 1
         return touched
 
     def redo(self) -> list[int]:
-        if not self._redo_stack:
+        if self._cursor + 1 >= len(self._timeline):
             return []
-        command = self._redo_stack.pop()
+        self._cursor += 1
+        command = self._timeline[self._cursor]
         touched = command.apply()
-        self._undo_stack.append(command)
         return touched
 
     def can_undo(self) -> bool:
-        return bool(self._undo_stack)
+        return self._cursor >= 0
 
     def can_redo(self) -> bool:
-        return bool(self._redo_stack)
+        return self._cursor + 1 < len(self._timeline)
+
+    def current_index(self) -> int:
+        return self._cursor
+
+    def jump_to(self, index: int) -> list[int]:
+        touched: list[int] = []
+        clamped = max(-1, min(int(index), len(self._timeline) - 1))
+        while self._cursor > clamped:
+            touched.extend(self.undo())
+        while self._cursor < clamped:
+            touched.extend(self.redo())
+        return sorted(set(touched))
+
+    def timeline_descriptions(self) -> list[str]:
+        return [command.description for command in self._timeline]
 
 
 class AppCommands:
@@ -169,31 +186,55 @@ class AppCommands:
         self.mesh_model = mesh_model
         self.paint_tool = paint_tool
         self.history = CommandManager()
+        self._timeline_snapshots: list[dict[str, object]] = []
+        self._sync_timeline_snapshots()
 
     def attach(self, mesh_model: MeshModel, paint_tool: PaintTool) -> None:
         self.mesh_model = mesh_model
         self.paint_tool = paint_tool
         self.history = CommandManager()
+        self._sync_timeline_snapshots()
+
+    def _sync_timeline_snapshots(self) -> None:
+        self._timeline_snapshots = []
+        if self.mesh_model is not None:
+            self._timeline_snapshots.append(self.mesh_model.to_project_dict())
+
+    def _record_snapshot(self) -> None:
+        if self.mesh_model is None:
+            return
+        next_index = self.history.current_index() + 1
+        if next_index < len(self._timeline_snapshots):
+            self._timeline_snapshots = self._timeline_snapshots[:next_index]
+        self._timeline_snapshots.append(self.mesh_model.to_project_dict())
 
     def paint_faces(self, updates: dict[int, Color], description: str = "Paint faces") -> list[int]:
         if self.mesh_model is None:
             return []
-        return self.history.execute(
+        touched = self.history.execute(
             PaintFacesCommand(mesh_model=self.mesh_model, updates=updates, description=description)
         )
+        self._record_snapshot()
+        return touched
 
     def add_sketch_entity(self, document: SketchDocument, entity: SketchEntity) -> list[int]:
-        return self.history.execute(SketchEntityCommand(document=document, entity=entity))
+        touched = self.history.execute(SketchEntityCommand(document=document, entity=entity))
+        self._record_snapshot()
+        return touched
 
     def update_sketch_entity(
         self, document: SketchDocument, entity_id: str, new_data: dict[str, object]
     ) -> list[int]:
-        return self.history.execute(
+        touched = self.history.execute(
             UpdateSketchEntityCommand(document=document, entity_id=entity_id, new_data=new_data)
         )
+        self._record_snapshot()
+        return touched
 
     def delete_sketch_entity(self, document: SketchDocument, entity_id: str) -> list[int]:
-        return self.history.execute(DeleteSketchEntityCommand(document=document, entity_id=entity_id))
+        touched = self.history.execute(DeleteSketchEntityCommand(document=document, entity_id=entity_id))
+        self._record_snapshot()
+        return touched
 
     def set_masked_faces(
         self,
@@ -202,16 +243,34 @@ class AppCommands:
     ) -> list[int]:
         if self.mesh_model is None:
             return []
-        return self.history.execute(
+        touched = self.history.execute(
             SetMaskedFacesCommand(
                 mesh_model=self.mesh_model,
                 new_masked_faces={int(face_id) for face_id in face_ids},
                 description=description,
             )
         )
+        self._record_snapshot()
+        return touched
 
     def undo(self) -> list[int]:
         return self.history.undo()
 
     def redo(self) -> list[int]:
         return self.history.redo()
+
+    def timeline_descriptions(self) -> list[str]:
+        return ["Initial state", *self.history.timeline_descriptions()]
+
+    def timeline_index(self) -> int:
+        return self.history.current_index() + 1
+
+    def jump_to_timeline_index(self, timeline_index: int) -> list[int]:
+        return self.history.jump_to(int(timeline_index) - 1)
+
+    def export_timeline(self) -> dict[str, object]:
+        return {
+            "current_index": self.timeline_index(),
+            "descriptions": self.timeline_descriptions(),
+            "snapshots": self._timeline_snapshots,
+        }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from tkinter import Tk, filedialog
 
 import dearpygui.dearpygui as dpg
 import numpy as np
@@ -14,14 +15,14 @@ from .camera import OrbitCamera
 from .color_utils import DEFAULT_COLOR, Color, clamp_color
 from .commands import AppCommands
 from .config import load_local_config, save_local_config
-from .exporter import export_3mf
+from .exporter import SUPPORTED_EXPORT_EXTENSIONS, export_model
 from .importer import load_stl
 from .interaction_state import InteractionState
 from .logging_utils import log_file_path
 from .mesh_model import MeshModel
 from .paint_tool import PaintTool
 from .picking import PickResult, pick_face_location_cpu
-from .project_io import load_project, save_project
+from .project_io import PROJECT_EXTENSION, load_project, load_tg3d, save_tg3d
 from .renderer import MeshRenderer, RenderSnapshot, make_grid_snapshot
 from .sketch_tool import SketchTool, entity_snap_points
 from .ui_panels import sync_mode_sections
@@ -84,6 +85,16 @@ class TexturePainterApp:
         self._load_svg_settings()
         self._create_ui()
 
+    def _pick_path_native(self, *, save: bool, title: str, filetypes: list[tuple[str, str]]) -> str | None:
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            value = filedialog.asksaveasfilename(title=title, filetypes=filetypes) if save else filedialog.askopenfilename(title=title, filetypes=filetypes)
+        finally:
+            root.destroy()
+        return str(value) if value else None
+
     def _load_ai_settings(self) -> None:
         payload = load_local_config()
         ai = payload.get("ai_settings", {})
@@ -138,9 +149,9 @@ class TexturePainterApp:
         self._create_file_dialogs()
         with dpg.window(label="STL Texture Painter", tag="main_window"):
             with dpg.group(horizontal=True):
-                dpg.add_button(label=f"{ICON['open']} Open STL / Project", callback=lambda: dpg.show_item("open_dialog"), width=180)
-                dpg.add_button(label=f"{ICON['export']} Export 3MF", callback=lambda: dpg.show_item("export_dialog"), width=130)
-                dpg.add_button(label=f"{ICON['save']} Save Project", callback=lambda: dpg.show_item("save_project_dialog"), width=140)
+                dpg.add_button(label=f"{ICON['open']} Open STL / Project", callback=self._on_open_click, width=180)
+                dpg.add_button(label=f"{ICON['export']} Export Model", callback=self._on_export_click, width=130)
+                dpg.add_button(label=f"{ICON['save']} Save Project", callback=self._on_save_project_click, width=140)
                 dpg.add_button(label=f"{ICON['bake']} Bake Sketch", callback=self._on_bake_sketch, width=130)
                 dpg.add_button(label=f"{ICON['undo']} Undo", callback=self._on_undo, width=90)
                 dpg.add_button(label=f"{ICON['redo']} Redo", callback=self._on_redo, width=90)
@@ -158,6 +169,10 @@ class TexturePainterApp:
                         dpg.add_key_down_handler(callback=self._on_key_down)
                         dpg.add_key_release_handler(callback=self._on_key_release)
                 self._build_right_sidebar()
+            dpg.add_separator()
+            dpg.add_text("Timeline")
+            dpg.add_slider_int(label="History", tag="timeline_slider", min_value=0, max_value=0, default_value=0, callback=self._on_timeline_change, width=-1)
+            dpg.add_text("Step 0/0 | Initial state", tag="timeline_status")
         dpg.create_viewport(title="STL Texture Painter", width=1680, height=920)
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -340,13 +355,6 @@ class TexturePainterApp:
             dpg.add_input_text(multiline=True, readonly=True, height=180, tag="ai_tool_log")
 
     def _create_file_dialogs(self) -> None:
-        with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_open_selected, tag="open_dialog", width=700, height=400):
-            dpg.add_file_extension(".stl")
-            dpg.add_file_extension(".json")
-        with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_export_selected, tag="export_dialog", width=700, height=400):
-            dpg.add_file_extension(".3mf")
-        with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_save_project_selected, tag="save_project_dialog", width=700, height=400):
-            dpg.add_file_extension(".json")
         with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_image_selected, tag="image_dialog", width=700, height=400):
             dpg.add_file_extension(".png")
             dpg.add_file_extension(".jpg")
@@ -445,7 +453,17 @@ class TexturePainterApp:
         )
         self._refresh_mask_count()
         self._refresh_selected_count()
+        self._refresh_timeline()
         self._set_status(f"Loaded {Path(mesh_model.source_path or 'project').name}")
+
+    def _refresh_timeline(self) -> None:
+        descriptions = self.commands.timeline_descriptions()
+        current = self.commands.timeline_index()
+        max_index = max(0, len(descriptions) - 1)
+        dpg.configure_item("timeline_slider", max_value=max_index)
+        dpg.set_value("timeline_slider", min(current, max_index))
+        current_desc = descriptions[min(current, max_index)] if descriptions else "Initial state"
+        dpg.set_value("timeline_status", f"Step {current}/{max_index} | {current_desc}")
 
     def _render_snapshot(self) -> RenderSnapshot:
         if self.mesh_model is None or self.renderer is None:
@@ -612,6 +630,7 @@ class TexturePainterApp:
         if self.renderer is not None and touched:
             self.renderer.update_face_colours(touched)
         self._mark_viewport_dirty()
+        self._refresh_timeline()
 
     def _apply_paint_at_pick(self, pick: PickResult) -> None:
         if self.mesh_model is None or self.paint_tool is None:
@@ -848,7 +867,7 @@ class TexturePainterApp:
     def _on_mouse_wheel(self, _sender: int, app_data: float) -> None:
         if not self._mouse_inside_viewport():
             return
-        self.camera.zoom(app_data * 0.1)
+        self.camera.zoom(app_data * 0.25)
         self._mark_viewport_dirty()
 
     def _on_key_down(self, _sender: int, app_data: int) -> None:
@@ -857,7 +876,15 @@ class TexturePainterApp:
         if app_data in (528, 532):
             self.state.shift_down = True
         if self.state.ctrl_down and app_data == 571:
-            self._on_undo()
+            if self.state.shift_down:
+                self._on_redo()
+            else:
+                self._on_undo()
+
+    def _on_timeline_change(self, _sender: int, app_data: int) -> None:
+        touched = self.commands.jump_to_timeline_index(int(app_data))
+        self._apply_updates(touched)
+        self._refresh_mask_count()
 
     def _on_key_release(self, _sender: int, app_data: int) -> None:
         if app_data in (527, 531):
@@ -865,29 +892,63 @@ class TexturePainterApp:
         if app_data in (528, 532):
             self.state.shift_down = False
 
-    def _on_open_selected(self, _sender: int, app_data: dict[str, object]) -> None:
+    def _on_open_selected(self, path: str) -> None:
         try:
-            path = str(app_data["file_path_name"])
-            mesh_model = load_project(path) if Path(path).suffix.lower() == ".json" else load_stl(path)
+            suffix = Path(path).suffix.lower()
+            if suffix == PROJECT_EXTENSION:
+                mesh_model, _timeline = load_tg3d(path)
+            elif suffix == ".json":
+                mesh_model = load_project(path)
+            else:
+                mesh_model = load_stl(path)
             self._load_mesh_model(mesh_model)
         except Exception as exc:
             logger.exception("Open failed")
             self._set_status(f"Open failed: {exc} | See log: {log_file_path().name}")
 
-    def _on_export_selected(self, _sender: int, app_data: dict[str, object]) -> None:
+    def _on_export_selected(self, path: str) -> None:
         if self.mesh_model is None:
             self._set_status("No mesh loaded")
             return
-        path = str(app_data["file_path_name"])
-        export_3mf(path, self.mesh_model)
+        export_model(path, self.mesh_model)
         self._set_status(f"Exported {Path(path).name}")
 
-    def _on_save_project_selected(self, _sender: int, app_data: dict[str, object]) -> None:
+    def _on_save_project_selected(self, path: str) -> None:
         if self.mesh_model is None:
             self._set_status("No mesh loaded")
             return
-        save_project(str(app_data["file_path_name"]), self.mesh_model)
-        self._set_status("Saved project JSON")
+        save_tg3d(path, self.mesh_model, timeline=self.commands.export_timeline())
+        self._set_status("Saved project .tg3d")
+
+    def _on_open_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+        path = self._pick_path_native(
+            save=False,
+            title="Open model or project",
+            filetypes=[("3D Files", "*.stl *.tg3d *.json"), ("All files", "*.*")],
+        )
+        if path:
+            self._on_open_selected(path)
+
+    def _on_export_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+        formats = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXPORT_EXTENSIONS))
+        path = self._pick_path_native(
+            save=True,
+            title="Export model",
+            filetypes=[("3D Files", formats), ("All files", "*.*")],
+        )
+        if path:
+            self._on_export_selected(path)
+
+    def _on_save_project_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+        path = self._pick_path_native(
+            save=True,
+            title="Save TG3D Project",
+            filetypes=[("Tungsten Project", f"*{PROJECT_EXTENSION}"), ("All files", "*.*")],
+        )
+        if path:
+            if Path(path).suffix.lower() != PROJECT_EXTENSION:
+                path = f"{path}{PROJECT_EXTENSION}"
+            self._on_save_project_selected(path)
 
     def _on_image_selected(self, _sender: int, app_data: dict[str, object]) -> None:
         self.state.ai_settings.image_path = str(app_data["file_path_name"])
@@ -1052,4 +1113,4 @@ def export_demo_mesh(path: str | Path) -> None:
         default_colour=DEFAULT_COLOR,
     )
     with NamedTemporaryFile(suffix=".3mf", delete=False) as handle:
-        export_3mf(handle.name, cube)
+        export_model(handle.name, cube)

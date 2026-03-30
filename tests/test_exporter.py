@@ -3,7 +3,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 import zipfile
 
-from stl_painter.exporter import export_3mf
+from stl_painter.exporter import export_3mf, export_model
 
 
 def test_export_3mf_writes_expected_package(tmp_path, square_mesh) -> None:
@@ -30,3 +30,11 @@ def test_export_3mf_writes_expected_package(tmp_path, square_mesh) -> None:
         assert len(colours) >= 2
         assert len(triangles) == 2
         assert all(triangle.attrib["pid"] == "1" for triangle in triangles)
+
+
+def test_export_model_common_formats(tmp_path, square_mesh) -> None:
+    for ext in (".obj", ".stl", ".glb", ".ply"):
+        output = tmp_path / f"mesh{ext}"
+        issues = export_model(output, square_mesh)
+        assert output.exists()
+        assert issues

@@ -11,6 +11,8 @@ from .color_utils import Color, DEFAULT_COLOR, rgb_hex
 from .mesh_model import MeshModel
 from .sketch_tool import bake_sketch_to_faces
 
+SUPPORTED_EXPORT_EXTENSIONS = {".3mf", ".stl", ".obj", ".ply", ".glb", ".gltf", ".fbx"}
+
 CORE_NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
 MAT_NS = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
 ET.register_namespace("", CORE_NS)
@@ -115,4 +117,18 @@ def export_3mf(
         archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", rels)
         archive.writestr("3D/3dmodel.model", model_xml)
+    return issues
+
+
+def export_model(path: str | Path, mesh_model: MeshModel) -> list[str]:
+    output = Path(path)
+    ext = output.suffix.lower()
+    if ext not in SUPPORTED_EXPORT_EXTENSIONS:
+        raise ValueError(f"Unsupported export format '{ext}'. Supported: {sorted(SUPPORTED_EXPORT_EXTENSIONS)}")
+    if ext == ".3mf":
+        return export_3mf(output, mesh_model)
+    mesh, issues = validate_for_export(mesh_model)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    file_type = "gltf" if ext == ".gltf" else ext[1:]
+    mesh.export(output, file_type=file_type)
     return issues

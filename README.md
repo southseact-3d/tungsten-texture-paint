@@ -1,6 +1,6 @@
 # STL Texture Painter
 
-Desktop Python app for loading STL meshes, painting per-face colours, sketching viewport overlays, baking those overlays to triangle colours, and exporting a coloured 3MF package.
+Desktop Python app for loading STL meshes, painting per-face colours, sketching viewport overlays, baking those overlays to triangle colours, exporting in common 3D formats, and saving timeline-aware `.tg3d` projects.
 
 ## What is implemented
 
@@ -11,6 +11,7 @@ Desktop Python app for loading STL meshes, painting per-face colours, sketching 
 - Milestone 5: sketch overlay primitives for text, rectangles, lines, and freehand strokes
 - Milestone 6: sketch baking from viewport projection into per-face colours
 - Milestone 7: mesh validation messaging, GPU picking path, project save/load JSON
+- Milestone 8: native file dialogs, timeline slider, Ctrl+Z/Ctrl+Shift+Z, multi-format export (`3mf`, `obj`, `glb`, `gltf`, `stl`, `ply`, `fbx`), `.tg3d` project format
 
 ## Run locally
 

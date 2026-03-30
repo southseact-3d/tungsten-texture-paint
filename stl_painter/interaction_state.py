@@ -37,7 +37,7 @@ class AISettings:
     provider_base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4.1-mini"
-    timeout: float = 60.0
+    timeout: float = 240.0
     system_prompt_version: str = "v1"
     image_path: str = ""
 

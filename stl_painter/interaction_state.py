@@ -64,6 +64,7 @@ class InteractionState:
     marquee_end: tuple[float, float] | None = None
     svg_tint: Color = (255, 255, 255, 255)
     recent_svgs: list[str] = field(default_factory=list)
+    recent_projects: list[str] = field(default_factory=list)
     freehand_points: list[tuple[float, float]] = field(default_factory=list)
     brush: BrushSettings = field(default_factory=BrushSettings)
     ai_settings: AISettings = field(default_factory=AISettings)

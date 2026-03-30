@@ -16,7 +16,7 @@ from .color_utils import DEFAULT_COLOR, Color, clamp_color
 from .commands import AppCommands
 from .config import load_local_config, save_local_config
 from .exporter import SUPPORTED_EXPORT_EXTENSIONS, export_model
-from .importer import load_stl
+from .importer import load_model
 from .interaction_state import InteractionState
 from .logging_utils import log_file_path
 from .mesh_model import MeshModel
@@ -83,6 +83,7 @@ class TexturePainterApp:
         self._last_brush_face: int | None = None
         self._load_ai_settings()
         self._load_svg_settings()
+        self._load_recent_projects()
         self._create_ui()
 
     def _pick_path_native(self, *, save: bool, title: str, filetypes: list[tuple[str, str]]) -> str | None:
@@ -131,6 +132,17 @@ class TexturePainterApp:
         tint = payload.get("last_svg_tint", list(self.state.svg_tint))
         self.state.svg_tint = clamp_color(tuple(tint))
 
+    def _load_recent_projects(self) -> None:
+        payload = load_local_config()
+        self.state.recent_projects = [
+            str(path)
+            for path in payload.get("recent_projects", [])
+            if Path(str(path)).exists() and Path(str(path)).suffix.lower() == PROJECT_EXTENSION
+        ]
+
+    def _save_recent_projects(self) -> None:
+        save_local_config({"recent_projects": self.state.recent_projects[:20]})
+
     def _save_svg_settings(self) -> None:
         save_local_config({"recent_svgs": self.state.recent_svgs[:10], "last_svg_tint": list(self.state.svg_tint)})
 
@@ -147,7 +159,25 @@ class TexturePainterApp:
                 tag="viewport_texture",
             )
         self._create_file_dialogs()
-        with dpg.window(label="STL Texture Painter", tag="main_window"):
+        with dpg.window(label="Tungsten Texture Paint", tag="home_window", width=720, height=520):
+            dpg.add_text("Welcome to Tungsten Texture Paint", color=(33, 55, 102))
+            dpg.add_text("Open a model/project or continue from a recent .tg3d session.", wrap=680)
+            dpg.add_separator()
+            with dpg.group(horizontal=True):
+                dpg.add_button(label=f"{ICON['open']} Open Model / Project", callback=self._on_open_click, width=220)
+                dpg.add_button(label="Start Empty Viewer", callback=lambda: self._show_main_window(), width=180)
+            dpg.add_spacer(height=8)
+            dpg.add_text("Recent Projects", color=(33, 55, 102))
+            dpg.add_listbox(
+                items=self.state.recent_projects or ["No recent projects yet"],
+                tag="recent_projects_list",
+                num_items=10,
+                width=-1,
+            )
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Open Selected Recent Project", callback=self._open_selected_recent_project, width=260)
+                dpg.add_button(label="Refresh", callback=lambda: self._refresh_recent_project_list(), width=110)
+        with dpg.window(label="STL Texture Painter", tag="main_window", show=False):
             with dpg.group(horizontal=True):
                 dpg.add_button(label=f"{ICON['open']} Open STL / Project", callback=self._on_open_click, width=180)
                 dpg.add_button(label=f"{ICON['export']} Export Model", callback=self._on_export_click, width=130)
@@ -176,7 +206,7 @@ class TexturePainterApp:
         dpg.create_viewport(title="STL Texture Painter", width=1680, height=920)
         dpg.setup_dearpygui()
         dpg.show_viewport()
-        dpg.set_primary_window("main_window", True)
+        dpg.set_primary_window("home_window", True)
         self._set_status("Ready")
         self._sync_tool_panels()
 
@@ -246,6 +276,11 @@ class TexturePainterApp:
                 tag="active_colour_picker",
                 alpha_bar=True,
             )
+            dpg.add_separator()
+            dpg.add_text("Model Transform", color=(33, 55, 102))
+            dpg.add_input_float(label="Scale Multiple", default_value=1.0, min_value=0.001, min_clamped=True, tag="model_scale_factor")
+            dpg.add_button(label="Apply Scale", callback=self._on_apply_scale_click, width=-1)
+            dpg.add_button(label="Import Variant & Transfer Paint", callback=self._on_import_variant_click, width=-1)
             with dpg.group(tag="paint_section"):
                 dpg.add_separator()
                 dpg.add_text("Paint Tools", color=(33, 55, 102))
@@ -438,6 +473,34 @@ class TexturePainterApp:
             return None
         return self.mesh_model.sketch_documents[-1]
 
+    def _show_main_window(self) -> None:
+        dpg.hide_item("home_window")
+        dpg.show_item("main_window")
+        dpg.set_primary_window("main_window", True)
+
+    def _refresh_recent_project_list(self) -> None:
+        self.state.recent_projects = [path for path in self.state.recent_projects if Path(path).exists()]
+        dpg.configure_item("recent_projects_list", items=self.state.recent_projects or ["No recent projects yet"])
+        self._save_recent_projects()
+
+    def _push_recent_project(self, path: str) -> None:
+        normalized = str(Path(path))
+        self.state.recent_projects = [item for item in self.state.recent_projects if item != normalized]
+        self.state.recent_projects.insert(0, normalized)
+        self.state.recent_projects = [
+            item
+            for item in self.state.recent_projects
+            if Path(item).exists() and Path(item).suffix.lower() == PROJECT_EXTENSION
+        ][:20]
+        self._refresh_recent_project_list()
+
+    def _open_selected_recent_project(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+        selected = dpg.get_value("recent_projects_list")
+        if not selected or selected == "No recent projects yet":
+            self._set_status("Select a recent project first")
+            return
+        self._on_open_selected(str(selected))
+
     def _load_mesh_model(self, mesh_model: MeshModel) -> None:
         self.mesh_model = mesh_model
         if not mesh_model.face_groups:
@@ -449,11 +512,13 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
         dpg.set_value(
             "mesh_info_text",
-            f"{Path(mesh_model.source_path or 'project').name}\nFaces: {mesh_model.face_count}\nVertices: {mesh_model.vertex_count}\nMasked: {len(mesh_model.masked_faces)}",
+            f"{Path(mesh_model.source_path or 'project').name}\nFaces: {mesh_model.face_count}\nVertices: {mesh_model.vertex_count}\nMasked: {len(mesh_model.masked_faces)}\nScale: {mesh_model.model_scale:.4f}x",
         )
+        dpg.set_value("model_scale_factor", 1.0)
         self._refresh_mask_count()
         self._refresh_selected_count()
         self._refresh_timeline()
+        self._show_main_window()
         self._set_status(f"Loaded {Path(mesh_model.source_path or 'project').name}")
 
     def _refresh_timeline(self) -> None:
@@ -897,14 +962,46 @@ class TexturePainterApp:
             suffix = Path(path).suffix.lower()
             if suffix == PROJECT_EXTENSION:
                 mesh_model, _timeline = load_tg3d(path)
+                self._push_recent_project(path)
             elif suffix == ".json":
                 mesh_model = load_project(path)
             else:
-                mesh_model = load_stl(path)
+                mesh_model = load_model(path)
             self._load_mesh_model(mesh_model)
         except Exception as exc:
             logger.exception("Open failed")
             self._set_status(f"Open failed: {exc} | See log: {log_file_path().name}")
+
+    def _on_apply_scale_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+        if self.mesh_model is None:
+            self._set_status("Load a model before scaling")
+            return
+        try:
+            factor = float(dpg.get_value("model_scale_factor"))
+            self.mesh_model.scale_uniform(factor)
+            self._load_mesh_model(self.mesh_model)
+            self._set_status(f"Scaled model by {factor:.4f}x")
+        except Exception as exc:
+            self._set_status(f"Scale failed: {exc}")
+
+    def _on_import_variant_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+        if self.mesh_model is None:
+            self._set_status("Load a base model before importing a variant")
+            return
+        path = self._pick_path_native(
+            save=False,
+            title="Import variant model",
+            filetypes=[("3D Files", "*.stl *.obj *.glb *.gltf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            variant = load_model(path)
+            mapped = variant.map_colours_from(self.mesh_model, normalize_scale=True)
+            self._load_mesh_model(variant)
+            self._set_status(f"Imported variant and mapped paint to {mapped} faces")
+        except Exception as exc:
+            self._set_status(f"Import variant failed: {exc}")
 
     def _on_export_selected(self, path: str) -> None:
         if self.mesh_model is None:
@@ -918,13 +1015,14 @@ class TexturePainterApp:
             self._set_status("No mesh loaded")
             return
         save_tg3d(path, self.mesh_model, timeline=self.commands.export_timeline())
+        self._push_recent_project(path)
         self._set_status("Saved project .tg3d")
 
     def _on_open_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
         path = self._pick_path_native(
             save=False,
             title="Open model or project",
-            filetypes=[("3D Files", "*.stl *.tg3d *.json"), ("All files", "*.*")],
+            filetypes=[("3D Files", "*.stl *.obj *.glb *.gltf *.tg3d *.json"), ("All files", "*.*")],
         )
         if path:
             self._on_open_selected(path)

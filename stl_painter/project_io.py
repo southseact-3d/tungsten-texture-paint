@@ -18,6 +18,10 @@ def migrate_project_payload(payload: dict[str, object]) -> dict[str, object]:
         migrated.setdefault("face_groups", {})
         migrated.setdefault("face_to_group", {})
         migrated["project_version"] = 3
+        version = 3
+    if version < 4:
+        migrated.setdefault("model_scale", 1.0)
+        migrated["project_version"] = 4
     if int(migrated.get("project_version", 1)) != PROJECT_VERSION:
         raise ValueError(
             f"Unsupported project version {migrated.get('project_version')} (expected {PROJECT_VERSION})"

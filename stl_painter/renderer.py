@@ -263,7 +263,6 @@ class MeshRenderer:
     def rebuild_edge_buffer(self) -> None:
         if not self._gpu_ready or self.ctx is None:
             return
-        face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
         internal_edges = self.mesh_model.get_internal_group_edges()
         edge_positions = []
 
@@ -286,10 +285,9 @@ class MeshRenderer:
                 self._edge_program,
                 [(self._edge_vbo, "3f", "in_position")],
             )
-            self._edge_vao = self.ctx.vertex_array(
-                self._edge_program,
-                [(self._edge_vbo, "3f", "in_position")],
-            )
+        else:
+            self._edge_vbo = None
+            self._edge_vao = None
 
     def _find_edge_neighbor(self, face_id: int, v0: int, v1: int) -> int | None:
         face_vertices = self.mesh_model.faces

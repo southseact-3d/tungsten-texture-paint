@@ -25,7 +25,12 @@ from .mesh_model import MeshModel
 from .paint_tool import PaintTool
 from .picking import PickResult, pick_face_location_cpu
 from .project_io import PROJECT_EXTENSION, load_project, load_tg3d, save_tg3d
-from .renderer import MeshRenderer, RenderSnapshot, make_grid_snapshot
+from .renderer import (
+    MeshRenderer,
+    RenderSnapshot,
+    make_grid_snapshot,
+    probe_gpu_support,
+)
 from .sketch_tool import SketchTool, entity_snap_points
 from .ui_panels import compute_workspace_layout, sync_mode_sections
 
@@ -1256,8 +1261,10 @@ class TexturePainterApp:
             mesh_model.compute_face_groups()
         group_count = len(mesh_model.face_groups)
         self.camera = OrbitCamera.for_mesh(mesh_model.vertices)
+        gpu_available, gpu_info = probe_gpu_support()
+        logger.info("GPU detection: available=%s, info=%s", gpu_available, gpu_info)
         self.renderer = MeshRenderer(
-            None, mesh_model, self.state.viewport_size, prefer_gpu=False
+            None, mesh_model, self.state.viewport_size, prefer_gpu=gpu_available
         )
         if group_count > 0 and self.renderer is not None:
             self.renderer.rebuild_edge_buffer()

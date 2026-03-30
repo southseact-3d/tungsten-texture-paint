@@ -92,11 +92,11 @@ class MeshRenderer:
         if scale_env:
             self._software_scale = float(scale_env)
         elif self.mesh_model.face_count > 50000:
-            self._software_scale = 0.65
+            self._software_scale = 0.85
         elif self.mesh_model.face_count > 25000:
-            self._software_scale = 0.78
+            self._software_scale = 0.95
         else:
-            self._software_scale = 0.9
+            self._software_scale = 1.0
         logger.info(
             "Initializing renderer | viewport=%s | faces=%s | vertices=%s | prefer_gpu=%s | software_scale=%.2f",
             viewport_size,
@@ -113,12 +113,16 @@ class MeshRenderer:
     def _resolve_gpu_preference(self, prefer_gpu: bool | None) -> bool:
         if prefer_gpu is not None:
             return prefer_gpu
+        force_software = (
+            os.environ.get("STL_TEXTURE_PAINTER_FORCE_SOFTWARE", "").strip().lower()
+        )
+        if force_software in {"1", "true", "yes", "on"}:
+            return False
         env_value = os.environ.get("STL_TEXTURE_PAINTER_ENABLE_GPU", "").strip().lower()
         if env_value in {"1", "true", "yes", "on"}:
             return True
         if env_value in {"0", "false", "no", "off"}:
             return False
-        # Default to auto-detect: try the GPU path first and fall back safely if it fails.
         return True
 
     @staticmethod

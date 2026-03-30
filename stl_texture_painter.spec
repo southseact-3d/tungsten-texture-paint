@@ -16,6 +16,7 @@ hiddenimports = [
     "moderngl_window",
     "trimesh",
     "glcontext",
+    "requests",
 ]
 
 # Collect dynamically imported modules and data required at runtime.
@@ -28,6 +29,10 @@ for package_name in (
     "glcontext",
     "pkg_resources",
     "setuptools",
+    "requests",
+    "urllib3",
+    "certifi",
+    "charset_normalizer",
 ):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package_name)
     datas += pkg_datas
@@ -37,6 +42,7 @@ for package_name in (
 hiddenimports += collect_submodules("pkg_resources")
 hiddenimports += collect_submodules("setuptools")
 hiddenimports += collect_submodules("numpy")
+hiddenimports += collect_submodules("requests")
 
 
 a = Analysis(
@@ -45,7 +51,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=[str(project_root)],
     hooksconfig={},
     runtime_hooks=[str(project_root / "fix_pkg_resources.py")],
     excludes=[],

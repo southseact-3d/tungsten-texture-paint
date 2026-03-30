@@ -96,8 +96,7 @@ class SketchDocument:
         return cls(
             plane=SketchPlane.from_dict(payload["plane"]),
             entities=[
-                SketchEntity.from_dict(item)
-                for item in payload.get("entities", [])
+                SketchEntity.from_dict(item) for item in payload.get("entities", [])
             ],
             selected_entity_id=payload.get("selected_entity_id"),
             grid_size=float(payload.get("grid_size", 0.1)),
@@ -132,19 +131,29 @@ class MeshModel:
         self.vertices = np.asarray(self.vertices, dtype=np.float32)
         self.faces = np.asarray(self.faces, dtype=np.int32)
         self.normals = np.asarray(self.normals, dtype=np.float32)
-        self.face_colours = {int(face_id): clamp_color(colour) for face_id, colour in self.face_colours.items()}
+        self.face_colours = {
+            int(face_id): clamp_color(colour)
+            for face_id, colour in self.face_colours.items()
+        }
         self.masked_faces = {int(face_id) for face_id in self.masked_faces}
         self.default_colour = clamp_color(self.default_colour)
         self.face_groups = {
             str(group_id): sorted({int(face_id) for face_id in faces})
             for group_id, faces in self.face_groups.items()
         }
-        self.face_to_group = {int(face_id): str(group_id) for face_id, group_id in self.face_to_group.items()}
+        self.face_to_group = {
+            int(face_id): str(group_id)
+            for face_id, group_id in self.face_to_group.items()
+        }
         self.model_scale = float(self.model_scale)
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
-            raise ValueError(f"Expected vertices shaped (n, 3), got {self.vertices.shape}")
+            raise ValueError(
+                f"Expected vertices shaped (n, 3), got {self.vertices.shape}"
+            )
         if self.faces.ndim != 2 or self.faces.shape[1] != 3:
-            raise ValueError(f"Expected triangular faces shaped (n, 3), got {self.faces.shape}")
+            raise ValueError(
+                f"Expected triangular faces shaped (n, 3), got {self.faces.shape}"
+            )
         if self.face_count == 0:
             raise ValueError("Mesh does not contain any faces after import cleanup")
         if self.normals.shape != (self.face_count, 3):
@@ -153,7 +162,9 @@ class MeshModel:
             )
 
     @classmethod
-    def from_trimesh(cls, mesh: trimesh.Trimesh, *, source_path: str | None = None) -> "MeshModel":
+    def from_trimesh(
+        cls, mesh: trimesh.Trimesh, *, source_path: str | None = None
+    ) -> "MeshModel":
         deduped = mesh.copy()
         deduped.update_faces(deduped.unique_faces())
         deduped.remove_unreferenced_vertices()
@@ -180,7 +191,12 @@ class MeshModel:
                     alpha = np.full((raw.shape[0], 1), 255, dtype=np.uint8)
                     raw = np.hstack([raw, alpha])
                 for face_id, colour in enumerate(raw):
-                    rgba = (int(colour[0]), int(colour[1]), int(colour[2]), int(colour[3]))
+                    rgba = (
+                        int(colour[0]),
+                        int(colour[1]),
+                        int(colour[2]),
+                        int(colour[3]),
+                    )
                     if rgba != DEFAULT_COLOR:
                         face_colours[face_id] = rgba
         return cls(
@@ -199,7 +215,9 @@ class MeshModel:
         self._mesh_cache = None
         self._face_centers = None
 
-    def map_colours_from(self, source: "MeshModel", *, normalize_scale: bool = True) -> int:
+    def map_colours_from(
+        self, source: "MeshModel", *, normalize_scale: bool = True
+    ) -> int:
         if self.face_count == 0 or source.face_count == 0:
             return 0
 
@@ -262,7 +280,13 @@ class MeshModel:
         positions = self.vertices[self.faces].reshape(-1, 3).astype(np.float32)
         normals = np.repeat(self.normals, 3, axis=0).astype(np.float32)
         colours = np.vstack(
-            [np.tile(np.array(self.face_colour(face_id), dtype=np.float32) / 255.0, (3, 1)) for face_id in range(self.face_count)]
+            [
+                np.tile(
+                    np.array(self.face_colour(face_id), dtype=np.float32) / 255.0,
+                    (3, 1),
+                )
+                for face_id in range(self.face_count)
+            ]
         ).astype(np.float32)
         return positions, normals, colours
 
@@ -270,14 +294,18 @@ class MeshModel:
         if self._adjacency is not None:
             return self._adjacency
         mesh = self.mesh()
-        adjacency: dict[int, set[int]] = {face_id: set() for face_id in range(self.face_count)}
+        adjacency: dict[int, set[int]] = {
+            face_id: set() for face_id in range(self.face_count)
+        }
         for left, right in mesh.face_adjacency:
             adjacency[int(left)].add(int(right))
             adjacency[int(right)].add(int(left))
         self._adjacency = adjacency
         return adjacency
 
-    def compute_face_groups(self, angle_tolerance_degrees: float = 180.0) -> dict[str, list[int]]:
+    def compute_face_groups(
+        self, angle_tolerance_degrees: float = 180.0
+    ) -> dict[str, list[int]]:
         adjacency = self.adjacency_map()
         max_angle = np.deg2rad(float(max(0.0, min(180.0, angle_tolerance_degrees))))
         visited: set[int] = set()
@@ -323,16 +351,36 @@ class MeshModel:
             self.compute_face_groups()
         return list(self.face_groups.get(str(group_id), []))
 
+    def get_internal_group_edges(self) -> set[tuple[int, int]]:
+        if not self.face_groups or not self.face_to_group:
+            return set()
+        adjacency = self.adjacency_map()
+        internal_edges: set[tuple[int, int]] = set()
+        for face_id in range(self.face_count):
+            group_id = self.face_to_group.get(face_id)
+            if group_id is None:
+                continue
+            for neighbor in adjacency.get(face_id, set()):
+                neighbor_group = self.face_to_group.get(neighbor)
+                if neighbor_group == group_id:
+                    edge = (min(face_id, neighbor), max(face_id, neighbor))
+                    internal_edges.add(edge)
+        return internal_edges
+
     def face_vertices(self, face_id: int) -> np.ndarray:
         return self.vertices[self.faces[int(face_id)]]
 
     def face_center(self, face_id: int) -> np.ndarray:
         if self._face_centers is None:
-            self._face_centers = self.vertices[self.faces].mean(axis=1).astype(np.float32)
+            self._face_centers = (
+                self.vertices[self.faces].mean(axis=1).astype(np.float32)
+            )
         return self._face_centers[int(face_id)]
 
     def mesh_extents(self) -> np.ndarray:
-        return (self.vertices.max(axis=0) - self.vertices.min(axis=0)).astype(np.float32)
+        return (self.vertices.max(axis=0) - self.vertices.min(axis=0)).astype(
+            np.float32
+        )
 
     def mesh_diagonal(self) -> float:
         return float(np.linalg.norm(self.mesh_extents()))
@@ -343,14 +391,25 @@ class MeshModel:
             "vertices": self.vertices.tolist(),
             "faces": self.faces.tolist(),
             "normals": self.normals.tolist(),
-            "face_colours": {str(face_id): list(colour) for face_id, colour in self.face_colours.items()},
+            "face_colours": {
+                str(face_id): list(colour)
+                for face_id, colour in self.face_colours.items()
+            },
             "default_colour": list(self.default_colour),
             "overlay_strokes": [
-                {"kind": stroke.kind, "data": stroke.data, "camera_matrix": stroke.camera_matrix.tolist()}
+                {
+                    "kind": stroke.kind,
+                    "data": stroke.data,
+                    "camera_matrix": stroke.camera_matrix.tolist(),
+                }
                 for stroke in self.overlay_strokes
             ],
             "legacy_overlay_strokes": [
-                {"kind": stroke.kind, "data": stroke.data, "camera_matrix": stroke.camera_matrix.tolist()}
+                {
+                    "kind": stroke.kind,
+                    "data": stroke.data,
+                    "camera_matrix": stroke.camera_matrix.tolist(),
+                }
                 for stroke in self.legacy_overlay_strokes
             ],
             "sketch_documents": [
@@ -359,22 +418,34 @@ class MeshModel:
             "masked_faces": sorted(self.masked_faces),
             "interaction_mode": self.interaction_mode,
             "source_path": self.source_path,
-            "face_groups": {group_id: list(faces) for group_id, faces in self.face_groups.items()},
-            "face_to_group": {str(face_id): group_id for face_id, group_id in self.face_to_group.items()},
+            "face_groups": {
+                group_id: list(faces) for group_id, faces in self.face_groups.items()
+            },
+            "face_to_group": {
+                str(face_id): group_id
+                for face_id, group_id in self.face_to_group.items()
+            },
             "model_scale": self.model_scale,
         }
 
     @classmethod
     def from_project_dict(cls, payload: dict[str, Any]) -> "MeshModel":
         overlay_strokes = [
-            Stroke(kind=item["kind"], data=item["data"], camera_matrix=np.asarray(item["camera_matrix"], dtype=np.float32))
+            Stroke(
+                kind=item["kind"],
+                data=item["data"],
+                camera_matrix=np.asarray(item["camera_matrix"], dtype=np.float32),
+            )
             for item in payload.get("overlay_strokes", [])
         ]
         return cls(
             vertices=np.asarray(payload["vertices"], dtype=np.float32),
             faces=np.asarray(payload["faces"], dtype=np.int32),
             normals=np.asarray(payload["normals"], dtype=np.float32),
-            face_colours={int(face_id): tuple(colour) for face_id, colour in payload.get("face_colours", {}).items()},
+            face_colours={
+                int(face_id): tuple(colour)
+                for face_id, colour in payload.get("face_colours", {}).items()
+            },
             default_colour=tuple(payload.get("default_colour", DEFAULT_COLOR)),
             overlay_strokes=[],
             legacy_overlay_strokes=overlay_strokes
@@ -393,7 +464,13 @@ class MeshModel:
             masked_faces=set(payload.get("masked_faces", [])),
             interaction_mode=str(payload.get("interaction_mode", "paint")),
             source_path=payload.get("source_path"),
-            face_groups={str(group_id): [int(face_id) for face_id in faces] for group_id, faces in payload.get("face_groups", {}).items()},
-            face_to_group={int(face_id): str(group_id) for face_id, group_id in payload.get("face_to_group", {}).items()},
+            face_groups={
+                str(group_id): [int(face_id) for face_id in faces]
+                for group_id, faces in payload.get("face_groups", {}).items()
+            },
+            face_to_group={
+                int(face_id): str(group_id)
+                for face_id, group_id in payload.get("face_to_group", {}).items()
+            },
             model_scale=float(payload.get("model_scale", 1.0)),
         )

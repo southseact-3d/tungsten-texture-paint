@@ -83,8 +83,10 @@ class MeshRenderer:
         self._colour_tex: moderngl.Texture | None = None
         self._pick_tex: moderngl.Texture | None = None
         self._colour_vertices: np.ndarray | None = None
-        self._face_centers = self.mesh_model.vertices[self.mesh_model.faces].mean(axis=1).astype(
-            np.float32
+        self._face_centers = (
+            self.mesh_model.vertices[self.mesh_model.faces]
+            .mean(axis=1)
+            .astype(np.float32)
         )
         scale_env = os.environ.get("STL_TEXTURE_PAINTER_SOFTWARE_SCALE", "").strip()
         if scale_env:
@@ -156,8 +158,10 @@ class MeshRenderer:
                 fragment_shader=self._shader_source("pick.frag"),
             )
 
-            positions = self.mesh_model.vertices[self.mesh_model.faces].reshape(-1, 3).astype(
-                "f4"
+            positions = (
+                self.mesh_model.vertices[self.mesh_model.faces]
+                .reshape(-1, 3)
+                .astype("f4")
             )
             face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
             normals = np.repeat(self.mesh_model.normals, 3, axis=0).astype("f4")
@@ -252,6 +256,49 @@ class MeshRenderer:
             color_attachments=[self._pick_tex], depth_attachment=pick_depth
         )
 
+    def rebuild_edge_buffer(self) -> None:
+        if not self._gpu_ready or self.ctx is None:
+            return
+        face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
+        internal_edges = self.mesh_model.get_internal_group_edges()
+        edge_positions = []
+
+        mesh = self.mesh_model.mesh()
+        if mesh and mesh.face_adjacency is not None:
+            vertex_pairs = [mesh.edges[i] for i in mesh.face_adjacency_edges]
+            face_pairs = mesh.face_adjacency
+
+            for (face1, face2), (v1, v2) in zip(face_pairs, vertex_pairs):
+                edge = (min(face1, face2), max(face1, face2))
+                if edge in internal_edges:
+                    continue
+                edge_positions.append(self.mesh_model.vertices[v1])
+                edge_positions.append(self.mesh_model.vertices[v2])
+
+        if edge_positions:
+            edge_positions_arr = np.array(edge_positions, dtype=np.float32)
+            self._edge_vbo = self.ctx.buffer(edge_positions_arr.tobytes())
+            self._edge_vao = self.ctx.vertex_array(
+                self._edge_program,
+                [(self._edge_vbo, "3f", "in_position")],
+            )
+            self._edge_vao = self.ctx.vertex_array(
+                self._edge_program,
+                [(self._edge_vbo, "3f", "in_position")],
+            )
+
+    def _find_edge_neighbor(self, face_id: int, v0: int, v1: int) -> int | None:
+        face_vertices = self.mesh_model.faces
+        for other_face in range(self.mesh_model.face_count):
+            if other_face == face_id:
+                continue
+            ov = face_vertices[other_face]
+            if (ov[0] == v0 or ov[1] == v0 or ov[2] == v0) and (
+                ov[0] == v1 or ov[1] == v1 or ov[2] == v1
+            ):
+                return other_face
+        return None
+
     def resize(self, viewport_size: tuple[int, int]) -> None:
         if viewport_size != self.viewport_size:
             self.viewport_size = viewport_size
@@ -263,34 +310,46 @@ class MeshRenderer:
     def update_face_colour(self, face_id: int) -> None:
         self._last_render_key = None
         self._last_pick_image = None
-        if not self._gpu_ready or self._colour_vertices is None or self._mesh_vbo is None:
+        if (
+            not self._gpu_ready
+            or self._colour_vertices is None
+            or self._mesh_vbo is None
+        ):
             return
-        base_colour = np.array(
-            self.mesh_model.face_colour(face_id), dtype=np.float32
-        ) / 255.0
+        base_colour = (
+            np.array(self.mesh_model.face_colour(face_id), dtype=np.float32) / 255.0
+        )
         start = face_id * 3
         end = start + 3
         self._colour_vertices[start:end, 6:10] = base_colour
         self._mesh_vbo.write(self._colour_vertices.tobytes())
 
-    def update_face_colours(self, face_ids: list[int] | tuple[int, ...] | set[int]) -> None:
+    def update_face_colours(
+        self, face_ids: list[int] | tuple[int, ...] | set[int]
+    ) -> None:
         if not face_ids:
             return
         self._last_render_key = None
         self._last_pick_image = None
-        if not self._gpu_ready or self._colour_vertices is None or self._mesh_vbo is None:
+        if (
+            not self._gpu_ready
+            or self._colour_vertices is None
+            or self._mesh_vbo is None
+        ):
             return
         for face_id in face_ids:
-            base_colour = np.array(
-                self.mesh_model.face_colour(face_id), dtype=np.float32
-            ) / 255.0
+            base_colour = (
+                np.array(self.mesh_model.face_colour(face_id), dtype=np.float32) / 255.0
+            )
             start = face_id * 3
             end = start + 3
             self._colour_vertices[start:end, 6:10] = base_colour
         self._mesh_vbo.write(self._colour_vertices.tobytes())
 
     def _camera_key(self, camera: OrbitCamera) -> tuple[tuple[int, int], bytes]:
-        return self.viewport_size, camera.mvp_matrix(self.viewport_size).astype("f4").tobytes()
+        return self.viewport_size, camera.mvp_matrix(self.viewport_size).astype(
+            "f4"
+        ).tobytes()
 
     def _mvp_bytes(self, camera: OrbitCamera) -> bytes:
         return camera.mvp_matrix(self.viewport_size).astype("f4").T.tobytes()
@@ -393,7 +452,9 @@ class MeshRenderer:
         if face_id == 0 and self.mesh_model.face_count > 0:
             sample = self._last_pick_image[mouse_y, mouse_x]
             if np.all(sample == 0):
-                return 0 if self._point_hits_face_zero(camera, mouse_x, mouse_y) else None
+                return (
+                    0 if self._point_hits_face_zero(camera, mouse_x, mouse_y) else None
+                )
         if face_id >= self.mesh_model.face_count:
             return None
         return face_id
@@ -444,7 +505,9 @@ class MeshRenderer:
         if min_area > 0.0:
             edge_a = projected[:, 1] - projected[:, 0]
             edge_b = projected[:, 2] - projected[:, 0]
-            double_area = np.abs(edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0])
+            double_area = np.abs(
+                edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]
+            )
             valid_faces &= double_area >= (min_area * 2.0)
         depths = face_vertices[:, :, 2].mean(axis=1)
         return projected, depths, valid_faces
@@ -478,7 +541,10 @@ class MeshRenderer:
         draw = ImageDraw.Draw(image, "RGBA")
 
         view_light = camera.position() - camera.target
-        light = np.asarray(light_dir, dtype=np.float32) + view_light.astype(np.float32) * 0.12
+        light = (
+            np.asarray(light_dir, dtype=np.float32)
+            + view_light.astype(np.float32) * 0.12
+        )
         light_norm = max(float(np.linalg.norm(light)), 1e-6)
         light = light / light_norm
 
@@ -489,7 +555,9 @@ class MeshRenderer:
             normal = normal / normal_norm
             diffuse = max(float(np.dot(normal, light)), 0.0)
             diffuse = 0.18 + diffuse * 0.82
-            base = np.asarray(self.mesh_model.face_colour(int(face_id)), dtype=np.float32)
+            base = np.asarray(
+                self.mesh_model.face_colour(int(face_id)), dtype=np.float32
+            )
             lit = np.clip(base[:3] * diffuse + 26.0, 0.0, 255.0).astype(np.uint8)
             draw.polygon(
                 points, fill=(int(lit[0]), int(lit[1]), int(lit[2]), int(base[3]))
@@ -530,7 +598,9 @@ class MeshRenderer:
         self._last_pick_image = pick_image
         return pick_image
 
-    def _point_hits_face_zero(self, camera: OrbitCamera, mouse_x: int, mouse_y: int) -> bool:
+    def _point_hits_face_zero(
+        self, camera: OrbitCamera, mouse_x: int, mouse_y: int
+    ) -> bool:
         projected, order = self._sorted_face_indices(camera, self.viewport_size)
         if len(order) == 0 or int(order[-1]) != 0:
             return False

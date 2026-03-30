@@ -11,7 +11,7 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 from PIL import Image
 
-from .ai_agent import AIAgent
+from .ai_agent import AIAgent, build_user_prompt
 from .ai_tools import AIToolContext
 from .camera import OrbitCamera
 from .color_utils import DEFAULT_COLOR, Color, clamp_color
@@ -27,7 +27,7 @@ from .picking import PickResult, pick_face_location_cpu
 from .project_io import PROJECT_EXTENSION, load_project, load_tg3d, save_tg3d
 from .renderer import MeshRenderer, RenderSnapshot, make_grid_snapshot
 from .sketch_tool import SketchTool, entity_snap_points
-from .ui_panels import sync_mode_sections
+from .ui_panels import compute_workspace_layout, sync_mode_sections
 
 logger = logging.getLogger(__name__)
 _USER32 = ctypes.windll.user32
@@ -44,6 +44,7 @@ class _RECT(ctypes.Structure):
         ("right", ctypes.c_long),
         ("bottom", ctypes.c_long),
     ]
+
 
 PALETTE: list[Color] = [
     (220, 220, 220, 255),
@@ -69,6 +70,7 @@ ICON = {
     "image": "🖼",
     "send": "✉",
     "svg": "📐",
+    "group": "🔗",
 }
 
 
@@ -98,6 +100,7 @@ class TexturePainterApp:
         self._key_lctrl = getattr(dpg, "mvKey_LControl", 527)
         self._key_rctrl = getattr(dpg, "mvKey_RControl", 531)
         self._key_z = getattr(dpg, "mvKey_Z", 571)
+        self._viewport_texture_tag: int | str | None = None
         self._texture_data = np.zeros(
             (self.state.viewport_size[1], self.state.viewport_size[0], 4),
             dtype=np.float32,
@@ -108,12 +111,18 @@ class TexturePainterApp:
         self._load_recent_projects()
         self._create_ui()
 
-    def _pick_path_native(self, *, save: bool, title: str, filetypes: list[tuple[str, str]]) -> str | None:
+    def _pick_path_native(
+        self, *, save: bool, title: str, filetypes: list[tuple[str, str]]
+    ) -> str | None:
         root = Tk()
         root.withdraw()
         root.attributes("-topmost", True)
         try:
-            value = filedialog.asksaveasfilename(title=title, filetypes=filetypes) if save else filedialog.askopenfilename(title=title, filetypes=filetypes)
+            value = (
+                filedialog.asksaveasfilename(title=title, filetypes=filetypes)
+                if save
+                else filedialog.askopenfilename(title=title, filetypes=filetypes)
+            )
         finally:
             root.destroy()
         return str(value) if value else None
@@ -127,10 +136,16 @@ class TexturePainterApp:
             ai.get("provider_base_url", self.state.ai_settings.provider_base_url)
         )
         self.state.ai_settings.api_key = str(ai.get("api_key", ""))
-        self.state.ai_settings.model = str(ai.get("model", self.state.ai_settings.model))
-        self.state.ai_settings.timeout = float(ai.get("timeout", self.state.ai_settings.timeout))
+        self.state.ai_settings.model = str(
+            ai.get("model", self.state.ai_settings.model)
+        )
+        self.state.ai_settings.timeout = float(
+            ai.get("timeout", self.state.ai_settings.timeout)
+        )
         self.state.ai_settings.system_prompt_version = str(
-            ai.get("system_prompt_version", self.state.ai_settings.system_prompt_version)
+            ai.get(
+                "system_prompt_version", self.state.ai_settings.system_prompt_version
+            )
         )
         self.state.ai_settings.image_path = str(ai.get("image_path", ""))
 
@@ -150,7 +165,11 @@ class TexturePainterApp:
 
     def _load_svg_settings(self) -> None:
         payload = load_local_config()
-        self.state.recent_svgs = [str(path) for path in payload.get("recent_svgs", []) if Path(str(path)).exists()]
+        self.state.recent_svgs = [
+            str(path)
+            for path in payload.get("recent_svgs", [])
+            if Path(str(path)).exists()
+        ]
         tint = payload.get("last_svg_tint", list(self.state.svg_tint))
         self.state.svg_tint = clamp_color(tuple(tint))
 
@@ -159,35 +178,58 @@ class TexturePainterApp:
         self.state.recent_projects = [
             str(path)
             for path in payload.get("recent_projects", [])
-            if Path(str(path)).exists() and Path(str(path)).suffix.lower() == PROJECT_EXTENSION
+            if Path(str(path)).exists()
+            and Path(str(path)).suffix.lower() == PROJECT_EXTENSION
         ]
 
     def _save_recent_projects(self) -> None:
         save_local_config({"recent_projects": self.state.recent_projects[:20]})
 
     def _save_svg_settings(self) -> None:
-        save_local_config({"recent_svgs": self.state.recent_svgs[:10], "last_svg_tint": list(self.state.svg_tint)})
+        save_local_config(
+            {
+                "recent_svgs": self.state.recent_svgs[:10],
+                "last_svg_tint": list(self.state.svg_tint),
+            }
+        )
 
     def _create_ui(self) -> None:
         dpg.create_context()
         self._apply_light_theme()
         self._load_default_font()
-        with dpg.texture_registry(show=False):
-            dpg.add_raw_texture(
+        with dpg.texture_registry(show=False, tag="texture_registry"):
+            self._viewport_texture_tag = dpg.add_raw_texture(
                 width=self.state.viewport_size[0],
                 height=self.state.viewport_size[1],
                 default_value=self._texture_data,
+                parent="texture_registry",
                 format=dpg.mvFormat_Float_rgba,
-                tag="viewport_texture",
             )
         self._create_file_dialogs()
-        with dpg.window(label="Tungsten Texture Paint", tag="home_window", width=720, height=520):
+        with dpg.window(
+            label="Tungsten Texture Paint",
+            tag="home_window",
+            width=720,
+            height=520,
+            show=False,
+        ):
             dpg.add_text("Welcome to Tungsten Texture Paint", color=(33, 55, 102))
-            dpg.add_text("Open a model/project or continue from a recent .tg3d session.", wrap=680)
+            dpg.add_text(
+                "Open a model/project or continue from a recent .tg3d session.",
+                wrap=680,
+            )
             dpg.add_separator()
             with dpg.group(horizontal=True):
-                dpg.add_button(label=f"{ICON['open']} Open Model / Project", callback=self._on_open_click, width=220)
-                dpg.add_button(label="Start Empty Viewer", callback=lambda: self._show_main_window(), width=180)
+                dpg.add_button(
+                    label=f"{ICON['open']} Open Model / Project",
+                    callback=self._on_open_click,
+                    width=220,
+                )
+                dpg.add_button(
+                    label="Start Empty Viewer",
+                    callback=lambda: self._show_main_window(),
+                    width=180,
+                )
             dpg.add_spacer(height=8)
             dpg.add_text("Recent Projects", color=(33, 55, 102))
             dpg.add_listbox(
@@ -197,16 +239,49 @@ class TexturePainterApp:
                 width=-1,
             )
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Open Selected Recent Project", callback=self._open_selected_recent_project, width=260)
-                dpg.add_button(label="Refresh", callback=lambda: self._refresh_recent_project_list(), width=110)
+                dpg.add_button(
+                    label="Open Selected Recent Project",
+                    callback=self._open_selected_recent_project,
+                    width=260,
+                )
+                dpg.add_button(
+                    label="Refresh",
+                    callback=lambda: self._refresh_recent_project_list(),
+                    width=110,
+                )
         with dpg.window(label="STL Texture Painter", tag="main_window", show=False):
             with dpg.group(horizontal=True):
-                dpg.add_button(label=f"{ICON['open']} Open STL / Project", callback=self._on_open_click, width=180)
-                dpg.add_button(label=f"{ICON['export']} Export Model", callback=self._on_export_click, width=130)
-                dpg.add_button(label=f"{ICON['save']} Save Project", callback=self._on_save_project_click, width=140)
-                dpg.add_button(label=f"{ICON['bake']} Bake Sketch", callback=self._on_bake_sketch, width=130)
-                dpg.add_button(label=f"{ICON['undo']} Undo", callback=self._on_undo, width=90)
-                dpg.add_button(label=f"{ICON['redo']} Redo", callback=self._on_redo, width=90)
+                dpg.add_button(
+                    label="Recent Projects",
+                    callback=self._show_home_window,
+                    width=130,
+                )
+                dpg.add_button(
+                    label=f"{ICON['open']} Open STL / Project",
+                    callback=self._on_open_click,
+                    width=180,
+                )
+                dpg.add_button(
+                    label=f"{ICON['export']} Export Model",
+                    callback=self._on_export_click,
+                    width=130,
+                )
+                dpg.add_button(
+                    label=f"{ICON['save']} Save Project",
+                    callback=self._on_save_project_click,
+                    width=140,
+                )
+                dpg.add_button(
+                    label=f"{ICON['bake']} Bake Sketch",
+                    callback=self._on_bake_sketch,
+                    width=130,
+                )
+                dpg.add_button(
+                    label=f"{ICON['undo']} Undo", callback=self._on_undo, width=90
+                )
+                dpg.add_button(
+                    label=f"{ICON['redo']} Redo", callback=self._on_redo, width=90
+                )
                 dpg.add_text("Preview Mode", tag="workspace_mode_label")
                 dpg.add_text("", tag="status_text")
             dpg.add_separator()
@@ -217,8 +292,13 @@ class TexturePainterApp:
             )
             with dpg.group(horizontal=True):
                 self._build_left_sidebar()
-                with dpg.child_window(autosize_x=True, autosize_y=True):
-                    dpg.add_image("viewport_texture", tag="viewport_image")
+                with dpg.child_window(
+                    width=self.state.viewport_size[0],
+                    height=self.state.viewport_size[1],
+                    border=False,
+                    tag="viewport_panel",
+                ):
+                    dpg.add_image(self._viewport_texture_tag, tag="viewport_image")
                     with dpg.window(
                         tag="viewport_nav",
                         label="",
@@ -231,7 +311,9 @@ class TexturePainterApp:
                     ):
                         dpg.add_text("View")
                         dpg.add_drawlist(width=132, height=132, tag="viewport_nav_pad")
-                        dpg.add_button(label="Home", width=72, callback=self._reset_view)
+                        dpg.add_button(
+                            label="Home", width=72, callback=self._reset_view
+                        )
                     with dpg.handler_registry():
                         dpg.add_mouse_down_handler(callback=self._on_mouse_down)
                         dpg.add_mouse_release_handler(callback=self._on_mouse_release)
@@ -242,14 +324,23 @@ class TexturePainterApp:
                 self._build_right_sidebar()
             dpg.add_separator()
             dpg.add_text("Timeline")
-            dpg.add_slider_int(label="History", tag="timeline_slider", min_value=0, max_value=0, default_value=0, callback=self._on_timeline_change, width=-1)
+            dpg.add_slider_int(
+                label="History",
+                tag="timeline_slider",
+                min_value=0,
+                max_value=0,
+                default_value=0,
+                callback=self._on_timeline_change,
+                width=-1,
+            )
             dpg.add_text("Step 0/0 | Initial state", tag="timeline_status")
         dpg.create_viewport(title="STL Texture Painter", width=1680, height=920)
         dpg.setup_dearpygui()
         dpg.show_viewport()
-        dpg.set_primary_window("home_window", True)
+        self._show_main_window()
         self._set_status("Ready")
         self._sync_tool_panels()
+        self._sync_workspace_layout(force=True)
 
     def _apply_light_theme(self) -> None:
         with dpg.theme(tag="light_app_theme"):
@@ -290,7 +381,7 @@ class TexturePainterApp:
                 return
 
     def _build_left_sidebar(self) -> None:
-        with dpg.child_window(width=300, autosize_y=True, tag="tools_panel"):
+        with dpg.child_window(width=300, height=-1, tag="tools_panel"):
             dpg.add_text("Workspace", color=(33, 55, 102))
             dpg.add_combo(
                 items=["paint", "sketch"],
@@ -308,7 +399,9 @@ class TexturePainterApp:
                         default_value=list(colour),
                         width=40,
                         height=30,
-                        callback=lambda _s, _a, user_data=index: self._select_palette_colour(user_data),
+                        callback=lambda _s, _a, _u=None, user_data=index: (
+                            self._select_palette_colour(user_data)
+                        ),
                     )
             dpg.add_color_picker(
                 label="Active Color",
@@ -319,9 +412,21 @@ class TexturePainterApp:
             )
             dpg.add_separator()
             dpg.add_text("Model Transform", color=(33, 55, 102))
-            dpg.add_input_float(label="Scale Multiple", default_value=1.0, min_value=0.001, min_clamped=True, tag="model_scale_factor")
-            dpg.add_button(label="Apply Scale", callback=self._on_apply_scale_click, width=-1)
-            dpg.add_button(label="Import Variant & Transfer Paint", callback=self._on_import_variant_click, width=-1)
+            dpg.add_input_float(
+                label="Scale Multiple",
+                default_value=1.0,
+                min_value=0.001,
+                min_clamped=True,
+                tag="model_scale_factor",
+            )
+            dpg.add_button(
+                label="Apply Scale", callback=self._on_apply_scale_click, width=-1
+            )
+            dpg.add_button(
+                label="Import Variant & Transfer Paint",
+                callback=self._on_import_variant_click,
+                width=-1,
+            )
             with dpg.group(tag="paint_section"):
                 dpg.add_separator()
                 dpg.add_text("Paint Tools", color=(33, 55, 102))
@@ -335,45 +440,83 @@ class TexturePainterApp:
                 dpg.add_checkbox(
                     label="Paint Linked Faces as Group",
                     default_value=self.state.paint_linked_faces,
-                    callback=lambda _s, value: setattr(self.state, "paint_linked_faces", bool(value)),
+                    callback=lambda _s, value: setattr(
+                        self.state, "paint_linked_faces", bool(value)
+                    ),
                 )
                 dpg.add_slider_float(
                     label="Radius",
                     min_value=0.01,
                     max_value=0.6,
                     default_value=self.state.brush.radius,
-                    callback=lambda _s, value: setattr(self.state.brush, "radius", float(value)),
+                    callback=lambda _s, value: setattr(
+                        self.state.brush, "radius", float(value)
+                    ),
                 )
                 dpg.add_slider_float(
                     label="Opacity",
                     min_value=0.05,
                     max_value=1.0,
                     default_value=self.state.brush.opacity,
-                    callback=lambda _s, value: setattr(self.state.brush, "opacity", float(value)),
+                    callback=lambda _s, value: setattr(
+                        self.state.brush, "opacity", float(value)
+                    ),
                 )
                 dpg.add_combo(
                     items=["constant", "linear", "smooth"],
                     default_value=self.state.brush.falloff,
                     label="Falloff",
-                    callback=lambda _s, value: setattr(self.state.brush, "falloff", value),
+                    callback=lambda _s, value: setattr(
+                        self.state.brush, "falloff", value
+                    ),
                 )
                 dpg.add_checkbox(
                     label="Front Faces Only",
                     default_value=self.state.brush.front_faces_only,
-                    callback=lambda _s, value: setattr(self.state.brush, "front_faces_only", bool(value)),
+                    callback=lambda _s, value: setattr(
+                        self.state.brush, "front_faces_only", bool(value)
+                    ),
                 )
                 dpg.add_slider_float(
                     label="Angle Tolerance",
                     min_value=5.0,
                     max_value=180.0,
                     default_value=self.state.brush.angle_tolerance_degrees,
-                    callback=lambda _s, value: setattr(self.state.brush, "angle_tolerance_degrees", float(value)),
+                    callback=lambda _s, value: setattr(
+                        self.state.brush, "angle_tolerance_degrees", float(value)
+                    ),
                 )
-                dpg.add_button(label=f"{ICON['clear']} Clear Mask", callback=self._on_clear_mask, width=-1)
-                dpg.add_button(label=f"{ICON['invert']} Invert Mask", callback=self._on_invert_mask, width=-1)
-                dpg.add_button(label=f"{ICON['paint']} Paint Selected", callback=self._paint_selected_faces, width=-1)
-                dpg.add_button(label=f"{ICON['mask']} Mask Selected", callback=self._mask_selected_faces, width=-1)
-                dpg.add_button(label=f"{ICON['select']} Clear Selection", callback=self._clear_face_selection, width=-1)
+                dpg.add_button(
+                    label=f"{ICON['group']} Group Faces",
+                    callback=self._on_group_faces,
+                    width=-1,
+                )
+                dpg.add_text("Groups: 0", tag="face_groups_count_text")
+                dpg.add_button(
+                    label=f"{ICON['clear']} Clear Mask",
+                    callback=self._on_clear_mask,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label=f"{ICON['invert']} Invert Mask",
+                    callback=self._on_invert_mask,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label=f"{ICON['paint']} Paint Selected",
+                    callback=self._paint_selected_faces,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label=f"{ICON['mask']} Mask Selected",
+                    callback=self._mask_selected_faces,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label=f"{ICON['select']} Clear Selection",
+                    callback=self._clear_face_selection,
+                    width=-1,
+                )
                 dpg.add_text("Masked faces: 0", tag="mask_count_text")
                 dpg.add_text("Selected faces: 0", tag="selected_count_text")
             with dpg.group(tag="sketch_section", show=False):
@@ -386,10 +529,27 @@ class TexturePainterApp:
                     callback=self._set_sketch_tool,
                     tag="sketch_tool_combo",
                 )
-                dpg.add_button(label=f"{ICON['svg']} Import SVG", callback=lambda: dpg.show_item("svg_dialog"), width=-1)
-                dpg.add_combo(items=self.state.recent_svgs or [""], label="Recent SVGs", tag="recent_svg_combo", callback=self._on_recent_svg_selected)
-                dpg.add_input_text(label="Text", default_value="Text", tag="sketch_text_value")
-                dpg.add_slider_int(label="Text Size", min_value=8, max_value=120, default_value=28, tag="sketch_text_size")
+                dpg.add_button(
+                    label=f"{ICON['svg']} Import SVG",
+                    callback=lambda: dpg.show_item("svg_dialog"),
+                    width=-1,
+                )
+                dpg.add_combo(
+                    items=self.state.recent_svgs or [""],
+                    label="Recent SVGs",
+                    tag="recent_svg_combo",
+                    callback=self._on_recent_svg_selected,
+                )
+                dpg.add_input_text(
+                    label="Text", default_value="Text", tag="sketch_text_value"
+                )
+                dpg.add_slider_int(
+                    label="Text Size",
+                    min_value=8,
+                    max_value=120,
+                    default_value=28,
+                    tag="sketch_text_size",
+                )
                 dpg.add_slider_float(
                     label="Stroke Width",
                     min_value=0.001,
@@ -397,45 +557,125 @@ class TexturePainterApp:
                     default_value=0.02,
                     tag="sketch_stroke_width",
                 )
-                dpg.add_slider_float(label="Grid", min_value=0.01, max_value=1.0, default_value=0.1, callback=self._set_sketch_grid)
-                dpg.add_checkbox(label="Snap To Grid", default_value=True, callback=self._set_snap_flag, user_data="grid")
-                dpg.add_checkbox(label="Snap To Vertices", default_value=True, callback=self._set_snap_flag, user_data="vertices")
-                dpg.add_checkbox(label="Snap To Edges", default_value=True, callback=self._set_snap_flag, user_data="edges")
-                dpg.add_checkbox(label="Snap To Entities", default_value=True, callback=self._set_snap_flag, user_data="entities")
+                dpg.add_slider_float(
+                    label="Grid",
+                    min_value=0.01,
+                    max_value=1.0,
+                    default_value=0.1,
+                    callback=self._set_sketch_grid,
+                )
+                dpg.add_checkbox(
+                    label="Snap To Grid",
+                    default_value=True,
+                    callback=self._set_snap_flag,
+                    user_data="grid",
+                )
+                dpg.add_checkbox(
+                    label="Snap To Vertices",
+                    default_value=True,
+                    callback=self._set_snap_flag,
+                    user_data="vertices",
+                )
+                dpg.add_checkbox(
+                    label="Snap To Edges",
+                    default_value=True,
+                    callback=self._set_snap_flag,
+                    user_data="edges",
+                )
+                dpg.add_checkbox(
+                    label="Snap To Entities",
+                    default_value=True,
+                    callback=self._set_snap_flag,
+                    user_data="entities",
+                )
                 dpg.add_text("Click a face first to start a sketch plane.", wrap=260)
 
     def _build_right_sidebar(self) -> None:
-        with dpg.child_window(width=360, autosize_y=True, tag="ai_panel"):
+        with dpg.child_window(width=360, height=-1, tag="ai_panel"):
             dpg.add_text("AI Assistant", color=(33, 55, 102))
+            dpg.add_text(
+                "Prompt is optional. If you provide only a reference image, the assistant will try to recreate that texture.",
+                wrap=320,
+                color=(72, 86, 110),
+            )
             dpg.add_input_text(
                 label="Base URL",
                 default_value=self.state.ai_settings.provider_base_url,
-                callback=lambda _s, value: setattr(self.state.ai_settings, "provider_base_url", value),
+                callback=lambda _s, value: setattr(
+                    self.state.ai_settings, "provider_base_url", value
+                ),
             )
             dpg.add_input_text(
                 label="API Key",
                 password=True,
                 default_value=self.state.ai_settings.api_key,
-                callback=lambda _s, value: setattr(self.state.ai_settings, "api_key", value),
+                callback=lambda _s, value: setattr(
+                    self.state.ai_settings, "api_key", value
+                ),
             )
             dpg.add_input_text(
                 label="Model",
                 default_value=self.state.ai_settings.model,
-                callback=lambda _s, value: setattr(self.state.ai_settings, "model", value),
+                callback=lambda _s, value: setattr(
+                    self.state.ai_settings, "model", value
+                ),
             )
-            dpg.add_input_text(label="Image", default_value=self.state.ai_settings.image_path, tag="ai_image_path")
-            dpg.add_button(label=f"{ICON['image']} Choose Image", callback=lambda: dpg.show_item("image_dialog"), width=-1)
-            dpg.add_input_text(multiline=True, height=120, hint="Describe the paint or sketch you want...", tag="ai_prompt_input")
-            dpg.add_button(label=f"{ICON['send']} Send To Assistant", callback=self._on_ai_send, width=-1)
-            dpg.add_input_text(multiline=True, readonly=True, height=220, tag="ai_chat_transcript")
-            dpg.add_input_text(multiline=True, readonly=True, height=180, tag="ai_tool_log")
+            dpg.add_combo(
+                label="Provider Preset",
+                items=["opencode.ai (default)", "chutes.ai (alt)"],
+                default_value="opencode.ai (default)",
+                callback=lambda _s, value: self._apply_provider_preset(value),
+            )
+            dpg.add_input_text(
+                label="Reference Image",
+                default_value=self.state.ai_settings.image_path,
+                tag="ai_image_path",
+            )
+            dpg.add_button(
+                label=f"{ICON['image']} Choose Image",
+                callback=lambda: dpg.show_item("image_dialog"),
+                width=-1,
+            )
+            dpg.add_separator()
+            dpg.add_text("Optional Prompt", color=(33, 55, 102))
+            dpg.add_input_text(
+                multiline=True,
+                height=150,
+                hint="Optional: describe the texture or sketch you want. Leave blank to recreate from the reference image only.",
+                tag="ai_prompt_input",
+            )
+            dpg.add_button(
+                label=f"{ICON['send']} Send To Assistant",
+                callback=self._on_ai_send,
+                width=-1,
+            )
+            dpg.add_input_text(
+                multiline=True, readonly=True, height=220, tag="ai_chat_transcript"
+            )
+            dpg.add_input_text(
+                multiline=True, readonly=True, height=180, tag="ai_tool_log"
+            )
 
     def _create_file_dialogs(self) -> None:
-        with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_image_selected, tag="image_dialog", width=700, height=400):
+        with dpg.file_dialog(
+            directory_selector=False,
+            show=False,
+            callback=self._on_image_selected,
+            tag="image_dialog",
+            width=700,
+            height=400,
+        ):
             dpg.add_file_extension(".png")
             dpg.add_file_extension(".jpg")
             dpg.add_file_extension(".jpeg")
-        with dpg.file_dialog(directory_selector=False, show=False, callback=self._on_svg_selected, tag="svg_dialog", width=700, height=400):
+        with dpg.file_dialog(
+            directory_selector=False,
+            show=False,
+            callback=self._on_svg_selected,
+            tag="svg_dialog",
+            width=700,
+            height=400,
+        ):
             dpg.add_file_extension(".svg")
 
     def _set_status(self, text: str) -> None:
@@ -484,6 +724,8 @@ class TexturePainterApp:
         in_paint_workspace = self.state.workspace_mode == "paint"
         if dpg.does_item_exist("tools_panel"):
             dpg.configure_item("tools_panel", show=in_paint_workspace)
+        if dpg.does_item_exist("ai_panel"):
+            dpg.configure_item("ai_panel", show=True)
         if dpg.does_item_exist("workspace_mode_label"):
             dpg.set_value(
                 "workspace_mode_label",
@@ -496,6 +738,7 @@ class TexturePainterApp:
                 else "Preview mode: orbit the model here. Press Tab to switch into texture paint mode."
             )
             dpg.set_value("workspace_hint_text", hint)
+        self._sync_workspace_layout(force=True)
 
     def _set_workspace_mode(self, mode: str) -> None:
         if self.state.workspace_mode == mode:
@@ -503,7 +746,9 @@ class TexturePainterApp:
         self.state.workspace_mode = mode  # type: ignore[assignment]
         self._sync_workspace_ui()
         self._mark_viewport_dirty()
-        self._set_status("Texture paint mode enabled" if mode == "paint" else "Preview mode enabled")
+        self._set_status(
+            "Texture paint mode enabled" if mode == "paint" else "Preview mode enabled"
+        )
 
     def _toggle_workspace_mode(self) -> None:
         next_mode = "paint" if self.state.workspace_mode == "preview" else "preview"
@@ -523,7 +768,9 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
 
     def _position_nav_widget(self) -> None:
-        if not dpg.does_item_exist("viewport_nav") or not dpg.does_item_exist("viewport_image"):
+        if not dpg.does_item_exist("viewport_nav") or not dpg.does_item_exist(
+            "viewport_image"
+        ):
             return
         image_pos = dpg.get_item_rect_min("viewport_image")
         image_size = dpg.get_item_rect_size("viewport_image")
@@ -551,12 +798,48 @@ class TexturePainterApp:
         axis_length = float(gizmo["axis_length"])
         rotation = self.camera.view_matrix()[:3, :3]
         axes = [
-            ("xp", np.array([1.0, 0.0, 0.0], dtype=np.float32), (227, 74, 89, 255), "X", True),
-            ("xn", np.array([-1.0, 0.0, 0.0], dtype=np.float32), (227, 74, 89, 255), "X", False),
-            ("yp", np.array([0.0, 1.0, 0.0], dtype=np.float32), (130, 196, 55, 255), "Y", True),
-            ("yn", np.array([0.0, -1.0, 0.0], dtype=np.float32), (130, 196, 55, 255), "Y", False),
-            ("zp", np.array([0.0, 0.0, 1.0], dtype=np.float32), (64, 150, 255, 255), "Z", True),
-            ("zn", np.array([0.0, 0.0, -1.0], dtype=np.float32), (64, 150, 255, 255), "Z", False),
+            (
+                "xp",
+                np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                (227, 74, 89, 255),
+                "X",
+                True,
+            ),
+            (
+                "xn",
+                np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+                (227, 74, 89, 255),
+                "X",
+                False,
+            ),
+            (
+                "yp",
+                np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                (130, 196, 55, 255),
+                "Y",
+                True,
+            ),
+            (
+                "yn",
+                np.array([0.0, -1.0, 0.0], dtype=np.float32),
+                (130, 196, 55, 255),
+                "Y",
+                False,
+            ),
+            (
+                "zp",
+                np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                (64, 150, 255, 255),
+                "Z",
+                True,
+            ),
+            (
+                "zn",
+                np.array([0.0, 0.0, -1.0], dtype=np.float32),
+                (64, 150, 255, 255),
+                "Z",
+                False,
+            ),
         ]
         items: list[dict[str, object]] = []
         for axis_name, direction, colour, label, positive in axes:
@@ -587,9 +870,28 @@ class TexturePainterApp:
         center = gizmo["center"]
         radius = gizmo["radius"]
         orbit_radius = gizmo["orbit_radius"]
-        dpg.draw_circle(center, radius, color=(118, 126, 140, 220), fill=(243, 245, 248, 210), thickness=2, parent="viewport_nav_pad")
-        dpg.draw_circle(center, orbit_radius, color=(208, 212, 220, 180), thickness=1, parent="viewport_nav_pad")
-        dpg.draw_circle(center, 4, color=(84, 90, 100, 255), fill=(84, 90, 100, 255), parent="viewport_nav_pad")
+        dpg.draw_circle(
+            center,
+            radius,
+            color=(118, 126, 140, 220),
+            fill=(243, 245, 248, 210),
+            thickness=2,
+            parent="viewport_nav_pad",
+        )
+        dpg.draw_circle(
+            center,
+            orbit_radius,
+            color=(208, 212, 220, 180),
+            thickness=1,
+            parent="viewport_nav_pad",
+        )
+        dpg.draw_circle(
+            center,
+            4,
+            color=(84, 90, 100, 255),
+            fill=(84, 90, 100, 255),
+            parent="viewport_nav_pad",
+        )
         axis_items = self._nav_axis_items()
         for item in sorted(axis_items, key=lambda axis: axis["depth"], reverse=True):
             start = center
@@ -597,7 +899,9 @@ class TexturePainterApp:
             line_colour = item["line_colour"]
             if not item["positive"]:
                 line_colour = (*line_colour[:3], 90)
-            dpg.draw_line(start, end, color=line_colour, thickness=2, parent="viewport_nav_pad")
+            dpg.draw_line(
+                start, end, color=line_colour, thickness=2, parent="viewport_nav_pad"
+            )
         for item in sorted(axis_items, key=lambda axis: axis["depth"], reverse=True):
             point = item["point"]
             hovered = self.state.nav_hover_axis == item["axis"]
@@ -605,15 +909,43 @@ class TexturePainterApp:
                 fill = item["fill"]
                 outline = (24, 24, 28, 255) if hovered else item["outline"]
                 radius_px = 16 if hovered else 14
-                dpg.draw_circle(point, radius_px, color=outline, fill=fill, thickness=2, parent="viewport_nav_pad")
-                dpg.draw_text((point[0] - 6, point[1] - 10), item["label"], color=(255, 255, 255, 255), size=18, parent="viewport_nav_pad")
+                dpg.draw_circle(
+                    point,
+                    radius_px,
+                    color=outline,
+                    fill=fill,
+                    thickness=2,
+                    parent="viewport_nav_pad",
+                )
+                dpg.draw_text(
+                    (point[0] - 6, point[1] - 10),
+                    item["label"],
+                    color=(255, 255, 255, 255),
+                    size=18,
+                    parent="viewport_nav_pad",
+                )
             else:
                 radius_px = 11 if hovered else 9
-                dpg.draw_circle(point, radius_px, color=item["outline"], fill=(0, 0, 0, 0), thickness=2, parent="viewport_nav_pad")
-        dpg.draw_text((28, 112), "Drag to rotate", color=(82, 88, 96, 255), size=13, parent="viewport_nav_pad")
+                dpg.draw_circle(
+                    point,
+                    radius_px,
+                    color=item["outline"],
+                    fill=(0, 0, 0, 0),
+                    thickness=2,
+                    parent="viewport_nav_pad",
+                )
+        dpg.draw_text(
+            (28, 112),
+            "Drag to rotate",
+            color=(82, 88, 96, 255),
+            size=13,
+            parent="viewport_nav_pad",
+        )
 
     def _nav_pad_hovered(self) -> bool:
-        return dpg.does_item_exist("viewport_nav_pad") and bool(dpg.is_item_hovered("viewport_nav_pad"))
+        return dpg.does_item_exist("viewport_nav_pad") and bool(
+            dpg.is_item_hovered("viewport_nav_pad")
+        )
 
     def _nav_pad_mouse_position(self) -> tuple[float, float] | None:
         if not dpg.does_item_exist("viewport_nav_pad"):
@@ -682,7 +1014,9 @@ class TexturePainterApp:
         dy = mouse_pos[1] - center_y
         for item in self._nav_axis_items():
             point_x, point_y = item["point"]  # type: ignore[misc]
-            if (mouse_pos[0] - point_x) ** 2 + (mouse_pos[1] - point_y) ** 2 <= (handle_radius + 5.0) ** 2:
+            if (mouse_pos[0] - point_x) ** 2 + (mouse_pos[1] - point_y) ** 2 <= (
+                handle_radius + 5.0
+            ) ** 2:
                 return "axis", str(item["axis"])
         if dx * dx + dy * dy <= (float(gizmo["radius"]) + 8.0) ** 2:
             return "orbit", None
@@ -715,29 +1049,49 @@ class TexturePainterApp:
         line_count = int(ceil(size / step))
         for i in range(-line_count, line_count + 1):
             v = i * step
-            p0 = self._project_world_to_screen(np.array([-size, 0.0, v], dtype=np.float32))
-            p1 = self._project_world_to_screen(np.array([size, 0.0, v], dtype=np.float32))
-            p2 = self._project_world_to_screen(np.array([v, 0.0, -size], dtype=np.float32))
-            p3 = self._project_world_to_screen(np.array([v, 0.0, size], dtype=np.float32))
+            p0 = self._project_world_to_screen(
+                np.array([-size, 0.0, v], dtype=np.float32)
+            )
+            p1 = self._project_world_to_screen(
+                np.array([size, 0.0, v], dtype=np.float32)
+            )
+            p2 = self._project_world_to_screen(
+                np.array([v, 0.0, -size], dtype=np.float32)
+            )
+            p3 = self._project_world_to_screen(
+                np.array([v, 0.0, size], dtype=np.float32)
+            )
             if p0 and p1:
                 strength = 0.32 if i % 5 == 0 else 0.16
                 self._draw_line(rgba, p0, p1, (0.30, 0.34, 0.38), alpha=strength)
             if p2 and p3:
                 strength = 0.32 if i % 5 == 0 else 0.16
                 self._draw_line(rgba, p2, p3, (0.30, 0.34, 0.38), alpha=strength)
-        ax0 = self._project_world_to_screen(np.array([-size, 0.0, 0.0], dtype=np.float32))
-        ax1 = self._project_world_to_screen(np.array([size, 0.0, 0.0], dtype=np.float32))
-        az0 = self._project_world_to_screen(np.array([0.0, 0.0, -size], dtype=np.float32))
-        az1 = self._project_world_to_screen(np.array([0.0, 0.0, size], dtype=np.float32))
+        ax0 = self._project_world_to_screen(
+            np.array([-size, 0.0, 0.0], dtype=np.float32)
+        )
+        ax1 = self._project_world_to_screen(
+            np.array([size, 0.0, 0.0], dtype=np.float32)
+        )
+        az0 = self._project_world_to_screen(
+            np.array([0.0, 0.0, -size], dtype=np.float32)
+        )
+        az1 = self._project_world_to_screen(
+            np.array([0.0, 0.0, size], dtype=np.float32)
+        )
         if ax0 and ax1:
             self._draw_line(rgba, ax0, ax1, (0.82, 0.22, 0.22), alpha=0.65)
         if az0 and az1:
             self._draw_line(rgba, az0, az1, (0.20, 0.35, 0.82), alpha=0.65)
-        center = self._project_world_to_screen(np.array([0.0, 0.0, 0.0], dtype=np.float32))
+        center = self._project_world_to_screen(
+            np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        )
         if center:
             cx, cy = center
             if 2 <= cx < width - 2 and 2 <= cy < rgba.shape[0] - 2:
-                rgba[cy - 2 : cy + 3, cx - 2 : cx + 3, :3] = np.array([0.15, 0.15, 0.15], dtype=np.float32)
+                rgba[cy - 2 : cy + 3, cx - 2 : cx + 3, :3] = np.array(
+                    [0.15, 0.15, 0.15], dtype=np.float32
+                )
                 rgba[cy - 2 : cy + 3, cx - 2 : cx + 3, 3] = 1.0
 
     def _select_palette_colour(self, index: int) -> None:
@@ -753,20 +1107,26 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
 
     def _refresh_selected_count(self) -> None:
-        dpg.set_value("selected_count_text", f"Selected faces: {len(self.state.selected_faces)}")
+        dpg.set_value(
+            "selected_count_text", f"Selected faces: {len(self.state.selected_faces)}"
+        )
 
     def _mask_selected_faces(self) -> None:
         if self.mesh_model is None or not self.state.selected_faces:
             return
         masked = set(self.mesh_model.masked_faces).union(self.state.selected_faces)
-        touched = self.commands.set_masked_faces(masked, description="Mask selected faces")
+        touched = self.commands.set_masked_faces(
+            masked, description="Mask selected faces"
+        )
         self._apply_updates(touched)
         self._refresh_mask_count()
 
     def _paint_selected_faces(self) -> None:
         if not self.state.selected_faces:
             return
-        updates = {face_id: self.state.active_colour for face_id in self.state.selected_faces}
+        updates = {
+            face_id: self.state.active_colour for face_id in self.state.selected_faces
+        }
         touched = self.commands.paint_faces(updates, description="Paint selected faces")
         self._apply_updates(touched)
 
@@ -776,19 +1136,103 @@ class TexturePainterApp:
         return self.mesh_model.sketch_documents[-1]
 
     def _show_main_window(self) -> None:
-        dpg.hide_item("home_window")
+        if dpg.does_item_exist("home_window"):
+            dpg.hide_item("home_window")
         dpg.show_item("main_window")
         dpg.set_primary_window("main_window", True)
         self._sync_workspace_ui()
 
+    def _show_home_window(self) -> None:
+        if dpg.does_item_exist("main_window"):
+            dpg.hide_item("main_window")
+        dpg.show_item("home_window")
+        dpg.set_primary_window("home_window", True)
+
+    def _resize_viewport_texture(self, width: int, height: int) -> None:
+        new_size = (max(1, int(width)), max(1, int(height)))
+        if new_size == self.state.viewport_size:
+            return
+        self.state.viewport_size = new_size
+        self._texture_data = np.zeros(
+            (self.state.viewport_size[1], self.state.viewport_size[0], 4),
+            dtype=np.float32,
+        )
+        if self._viewport_texture_tag is not None and dpg.does_item_exist(
+            self._viewport_texture_tag
+        ):
+            dpg.delete_item(self._viewport_texture_tag)
+        self._viewport_texture_tag = dpg.add_raw_texture(
+            width=self.state.viewport_size[0],
+            height=self.state.viewport_size[1],
+            default_value=self._texture_data,
+            parent="texture_registry",
+            format=dpg.mvFormat_Float_rgba,
+        )
+        if dpg.does_item_exist("viewport_image"):
+            dpg.configure_item(
+                "viewport_image",
+                texture_tag=self._viewport_texture_tag,
+                width=self.state.viewport_size[0],
+                height=self.state.viewport_size[1],
+            )
+        if self.renderer is not None:
+            self.renderer.resize(self.state.viewport_size)
+        self._mark_viewport_dirty()
+
+    def _sync_workspace_layout(self, *, force: bool = False) -> None:
+        if not dpg.does_item_exist("main_window") or not dpg.is_item_shown(
+            "main_window"
+        ):
+            return
+        window_width = int(dpg.get_viewport_client_width())
+        window_height = int(dpg.get_viewport_client_height())
+        layout = compute_workspace_layout(
+            window_width,
+            window_height,
+            show_tools_panel=self.state.workspace_mode == "paint",
+        )
+        if dpg.does_item_exist("tools_panel"):
+            dpg.configure_item(
+                "tools_panel",
+                width=layout.left_panel_width,
+                height=layout.workspace_height,
+            )
+        if dpg.does_item_exist("ai_panel"):
+            dpg.configure_item(
+                "ai_panel",
+                width=layout.right_panel_width,
+                height=layout.workspace_height,
+            )
+        if dpg.does_item_exist("viewport_panel"):
+            dpg.configure_item(
+                "viewport_panel",
+                width=layout.viewport_width,
+                height=layout.workspace_height,
+            )
+        if (
+            force
+            or layout.viewport_width != self.state.viewport_size[0]
+            or layout.workspace_height != self.state.viewport_size[1]
+        ):
+            self._resize_viewport_texture(
+                layout.viewport_width, layout.workspace_height
+            )
+
     def _refresh_recent_project_list(self) -> None:
-        self.state.recent_projects = [path for path in self.state.recent_projects if Path(path).exists()]
-        dpg.configure_item("recent_projects_list", items=self.state.recent_projects or ["No recent projects yet"])
+        self.state.recent_projects = [
+            path for path in self.state.recent_projects if Path(path).exists()
+        ]
+        dpg.configure_item(
+            "recent_projects_list",
+            items=self.state.recent_projects or ["No recent projects yet"],
+        )
         self._save_recent_projects()
 
     def _push_recent_project(self, path: str) -> None:
         normalized = str(Path(path))
-        self.state.recent_projects = [item for item in self.state.recent_projects if item != normalized]
+        self.state.recent_projects = [
+            item for item in self.state.recent_projects if item != normalized
+        ]
         self.state.recent_projects.insert(0, normalized)
         self.state.recent_projects = [
             item
@@ -797,7 +1241,9 @@ class TexturePainterApp:
         ][:20]
         self._refresh_recent_project_list()
 
-    def _open_selected_recent_project(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _open_selected_recent_project(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         selected = dpg.get_value("recent_projects_list")
         if not selected or selected == "No recent projects yet":
             self._set_status("Select a recent project first")
@@ -808,8 +1254,13 @@ class TexturePainterApp:
         self.mesh_model = mesh_model
         if not mesh_model.face_groups:
             mesh_model.compute_face_groups()
+        group_count = len(mesh_model.face_groups)
         self.camera = OrbitCamera.for_mesh(mesh_model.vertices)
-        self.renderer = MeshRenderer(None, mesh_model, self.state.viewport_size, prefer_gpu=False)
+        self.renderer = MeshRenderer(
+            None, mesh_model, self.state.viewport_size, prefer_gpu=False
+        )
+        if group_count > 0 and self.renderer is not None:
+            self.renderer.rebuild_edge_buffer()
         self.paint_tool = PaintTool(mesh_model)
         self.commands.attach(mesh_model, self.paint_tool)
         self._mark_viewport_dirty()
@@ -818,6 +1269,7 @@ class TexturePainterApp:
             f"{Path(mesh_model.source_path or 'project').name}\nFaces: {mesh_model.face_count}\nVertices: {mesh_model.vertex_count}\nMasked: {len(mesh_model.masked_faces)}\nScale: {mesh_model.model_scale:.4f}x",
         )
         dpg.set_value("model_scale_factor", 1.0)
+        dpg.set_value("face_groups_count_text", f"Groups: {group_count}")
         self._refresh_mask_count()
         self._refresh_selected_count()
         self._refresh_timeline()
@@ -833,7 +1285,9 @@ class TexturePainterApp:
         max_index = max(0, len(descriptions) - 1)
         dpg.configure_item("timeline_slider", max_value=max_index)
         dpg.set_value("timeline_slider", min(current, max_index))
-        current_desc = descriptions[min(current, max_index)] if descriptions else "Initial state"
+        current_desc = (
+            descriptions[min(current, max_index)] if descriptions else "Initial state"
+        )
         dpg.set_value("timeline_status", f"Step {current}/{max_index} | {current_desc}")
 
     def _render_snapshot(self) -> RenderSnapshot:
@@ -856,7 +1310,14 @@ class TexturePainterApp:
         y = int((1.0 - (ndc[1] * 0.5 + 0.5)) * height)
         return x, y
 
-    def _draw_line(self, rgba: np.ndarray, p0: tuple[int, int], p1: tuple[int, int], colour: tuple[float, float, float], alpha: float = 1.0) -> None:
+    def _draw_line(
+        self,
+        rgba: np.ndarray,
+        p0: tuple[int, int],
+        p1: tuple[int, int],
+        colour: tuple[float, float, float],
+        alpha: float = 1.0,
+    ) -> None:
         x0, y0 = p0
         x1, y1 = p1
         dx = x1 - x0
@@ -868,10 +1329,18 @@ class TexturePainterApp:
         mask = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
         xs = xs[mask]
         ys = ys[mask]
-        rgba[ys, xs, :3] = rgba[ys, xs, :3] * (1.0 - alpha) + np.array(colour, dtype=np.float32) * alpha
+        rgba[ys, xs, :3] = (
+            rgba[ys, xs, :3] * (1.0 - alpha)
+            + np.array(colour, dtype=np.float32) * alpha
+        )
         rgba[ys, xs, 3] = 1.0
 
-    def _draw_point(self, rgba: np.ndarray, point: tuple[int, int], colour: tuple[float, float, float]) -> None:
+    def _draw_point(
+        self,
+        rgba: np.ndarray,
+        point: tuple[int, int],
+        colour: tuple[float, float, float],
+    ) -> None:
         x, y = point
         h, w, _ = rgba.shape
         if 1 <= x < w - 1 and 1 <= y < h - 1:
@@ -883,7 +1352,12 @@ class TexturePainterApp:
         if document is None:
             return
         preview_entity = None
-        if self.state.dragging and self.state.interaction_mode == "sketch" and self.state.sketch_tool in {"rect", "line", "circle"} and self.state.drag_origin_plane is not None:
+        if (
+            self.state.dragging
+            and self.state.interaction_mode == "sketch"
+            and self.state.sketch_tool in {"rect", "line", "circle"}
+            and self.state.drag_origin_plane is not None
+        ):
             current_uv = self._screen_hit_on_plane(self._viewport_mouse_position())
             if current_uv is not None:
                 preview_entity = self.sketch_tool.create_entity(
@@ -895,9 +1369,21 @@ class TexturePainterApp:
                     stroke_width=float(dpg.get_value("sketch_stroke_width")),
                     text_size=int(dpg.get_value("sketch_text_size")),
                 )
-        for entity in document.entities + ([preview_entity] if preview_entity is not None else []):
-            colour = np.array(entity.data.get("colour", [255, 80, 80, 255]), dtype=np.float32)[:3] / 255.0
-            alpha = 0.45 if preview_entity is not None and entity.entity_id == preview_entity.entity_id else 1.0
+        for entity in document.entities + (
+            [preview_entity] if preview_entity is not None else []
+        ):
+            colour = (
+                np.array(
+                    entity.data.get("colour", [255, 80, 80, 255]), dtype=np.float32
+                )[:3]
+                / 255.0
+            )
+            alpha = (
+                0.45
+                if preview_entity is not None
+                and entity.entity_id == preview_entity.entity_id
+                else 1.0
+            )
             if entity.kind == "rect":
                 min_uv = np.asarray(entity.data["min"], dtype=np.float32)
                 max_uv = np.asarray(entity.data["max"], dtype=np.float32)
@@ -907,13 +1393,28 @@ class TexturePainterApp:
                     max_uv,
                     np.asarray([min_uv[0], max_uv[1]], dtype=np.float32),
                 ]
-                screens = [self._project_world_to_screen(self.sketch_tool.plane_to_world(document.plane, uv)) for uv in corners]
+                screens = [
+                    self._project_world_to_screen(
+                        self.sketch_tool.plane_to_world(document.plane, uv)
+                    )
+                    for uv in corners
+                ]
                 if all(screen is not None for screen in screens):
                     for index in range(4):
-                        self._draw_line(rgba, screens[index], screens[(index + 1) % 4], tuple(colour), alpha=alpha)  # type: ignore[arg-type]
+                        self._draw_line(
+                            rgba,
+                            screens[index],
+                            screens[(index + 1) % 4],
+                            tuple(colour),
+                            alpha=alpha,
+                        )  # type: ignore[arg-type]
             elif entity.kind == "line":
-                start = self.sketch_tool.plane_to_world(document.plane, np.asarray(entity.data["start"], dtype=np.float32))
-                end = self.sketch_tool.plane_to_world(document.plane, np.asarray(entity.data["end"], dtype=np.float32))
+                start = self.sketch_tool.plane_to_world(
+                    document.plane, np.asarray(entity.data["start"], dtype=np.float32)
+                )
+                end = self.sketch_tool.plane_to_world(
+                    document.plane, np.asarray(entity.data["end"], dtype=np.float32)
+                )
                 p0 = self._project_world_to_screen(start)
                 p1 = self._project_world_to_screen(end)
                 if p0 and p1:
@@ -924,7 +1425,11 @@ class TexturePainterApp:
                 ring = [
                     self.sketch_tool.plane_to_world(
                         document.plane,
-                        center + np.asarray([np.cos(angle) * radius, np.sin(angle) * radius], dtype=np.float32),
+                        center
+                        + np.asarray(
+                            [np.cos(angle) * radius, np.sin(angle) * radius],
+                            dtype=np.float32,
+                        ),
                     )
                     for angle in np.linspace(0.0, np.pi * 2.0, 24, endpoint=False)
                 ]
@@ -932,15 +1437,26 @@ class TexturePainterApp:
                 valid = [screen for screen in screens if screen is not None]
                 if len(valid) >= 2:
                     for index in range(len(valid)):
-                        self._draw_line(rgba, valid[index], valid[(index + 1) % len(valid)], tuple(colour), alpha=alpha)
+                        self._draw_line(
+                            rgba,
+                            valid[index],
+                            valid[(index + 1) % len(valid)],
+                            tuple(colour),
+                            alpha=alpha,
+                        )
             elif entity.kind == "text":
-                point = self.sketch_tool.plane_to_world(document.plane, np.asarray(entity.data["position"], dtype=np.float32))
+                point = self.sketch_tool.plane_to_world(
+                    document.plane,
+                    np.asarray(entity.data["position"], dtype=np.float32),
+                )
                 screen = self._project_world_to_screen(point)
                 if screen:
                     self._draw_point(rgba, screen, tuple(colour))
             if entity.entity_id == document.selected_entity_id:
                 for snap_uv in entity_snap_points(entity):
-                    point = self._project_world_to_screen(self.sketch_tool.plane_to_world(document.plane, snap_uv))
+                    point = self._project_world_to_screen(
+                        self.sketch_tool.plane_to_world(document.plane, snap_uv)
+                    )
                     if point:
                         self._draw_point(rgba, point, (1.0, 1.0, 1.0))
 
@@ -976,14 +1492,15 @@ class TexturePainterApp:
             return
         snapshot = self._render_snapshot()
         rgba = snapshot.rgba.astype(np.float32) / 255.0
-        if self.mesh_model is None or self.state.workspace_mode == "preview":
+        if self.mesh_model is None or self.state.workspace_mode in ("preview", "paint"):
             self._draw_world_grid(rgba)
         if self.mesh_model is not None:
             self._overlay_sketch_entities(rgba)
             self._overlay_masked_faces(rgba)
             self._overlay_selected_faces(rgba)
         self._texture_data[:, :, :] = rgba
-        dpg.set_value("viewport_texture", self._texture_data)
+        if self._viewport_texture_tag is not None:
+            dpg.set_value(self._viewport_texture_tag, self._texture_data)
         self._position_nav_widget()
         self._draw_nav_pad()
         self.state.viewport_dirty = False
@@ -992,7 +1509,10 @@ class TexturePainterApp:
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
         image_x, image_y = dpg.get_item_rect_min("viewport_image")
         width, height = dpg.get_item_rect_size("viewport_image")
-        within = image_x <= mouse_x < image_x + width and image_y <= mouse_y < image_y + height
+        within = (
+            image_x <= mouse_x < image_x + width
+            and image_y <= mouse_y < image_y + height
+        )
         return within or self._nav_pad_hovered()
 
     def _viewport_mouse_position(self) -> tuple[float, float]:
@@ -1003,7 +1523,13 @@ class TexturePainterApp:
     def _pick_result(self, mouse_pos: tuple[float, float]) -> PickResult | None:
         if self.mesh_model is None:
             return None
-        return pick_face_location_cpu(self.mesh_model, self.camera, mouse_pos[0], mouse_pos[1], self.state.viewport_size)
+        return pick_face_location_cpu(
+            self.mesh_model,
+            self.camera,
+            mouse_pos[0],
+            mouse_pos[1],
+            self.state.viewport_size,
+        )
 
     def _apply_updates(self, touched: list[int]) -> None:
         if self.renderer is not None and touched:
@@ -1011,7 +1537,9 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
         self._refresh_timeline()
 
-    def _apply_paint_at_pick(self, pick: PickResult) -> None:
+    def _apply_paint_at_pick(
+        self, pick: PickResult, *, single_face: bool = False
+    ) -> None:
         if self.mesh_model is None or self.paint_tool is None:
             return
         tool = self.state.paint_tool
@@ -1026,14 +1554,32 @@ class TexturePainterApp:
                 updated.remove(pick.face_id)
             else:
                 updated.add(pick.face_id)
-            touched = self.commands.set_masked_faces(updated, description="Toggle face mask")
+            touched = self.commands.set_masked_faces(
+                updated, description="Toggle face mask"
+            )
             self._apply_updates(touched)
             self._refresh_mask_count()
             return
         if tool == "fill":
-            updates = self.paint_tool.flood_fill_updates(pick.face_id, self.state.active_colour)
+            updates = self.paint_tool.flood_fill_updates(
+                pick.face_id, self.state.active_colour
+            )
+        elif single_face and tool in {"brush", "erase"}:
+            if pick.face_id in self.mesh_model.masked_faces:
+                updates = {}
+            else:
+                updates = {
+                    pick.face_id: (
+                        self.mesh_model.default_colour
+                        if tool == "erase"
+                        else self.state.active_colour
+                    )
+                }
         else:
-            radius = max(0.0001, self.state.brush.radius * max(1.0, self.mesh_model.mesh_diagonal()))
+            radius = max(
+                0.0001,
+                self.state.brush.radius * max(1.0, self.mesh_model.mesh_diagonal()),
+            )
             updates = self.paint_tool.brush_updates(
                 pick.face_id,
                 pick.location,
@@ -1049,11 +1595,17 @@ class TexturePainterApp:
             group_id = self.mesh_model.group_for_face(pick.face_id)
             if group_id is not None:
                 grouped_faces = self.mesh_model.faces_for_group(group_id)
-                group_colour = self.state.active_colour if tool != "erase" else self.mesh_model.default_colour
+                group_colour = (
+                    self.state.active_colour
+                    if tool != "erase"
+                    else self.mesh_model.default_colour
+                )
                 for face_id in grouped_faces:
                     if face_id not in self.mesh_model.masked_faces:
                         updates[face_id] = group_colour
-        touched = self.commands.paint_faces(updates, description=f"{tool.title()} stroke")
+        touched = self.commands.paint_faces(
+            updates, description=f"{tool.title()} stroke"
+        )
         self._apply_updates(touched)
 
     def _start_sketch_plane(self, face_id: int) -> None:
@@ -1068,28 +1620,50 @@ class TexturePainterApp:
         document = self._active_document()
         if document is None or self.mesh_model is None:
             return None
-        hit = self.sketch_tool.ray_to_plane(document.plane, self.camera, mouse_pos, self.state.viewport_size)
+        hit = self.sketch_tool.ray_to_plane(
+            document.plane, self.camera, mouse_pos, self.state.viewport_size
+        )
         if hit is None:
             return None
         shift_lock = self.state.drag_origin_plane if self.state.shift_down else None
-        return self.sketch_tool.snap_point(self.mesh_model, document, hit.plane_uv, shift_lock_axis=shift_lock).plane_uv
+        return self.sketch_tool.snap_point(
+            self.mesh_model, document, hit.plane_uv, shift_lock_axis=shift_lock
+        ).plane_uv
 
-    def _find_entity_handle(self, mouse_pos: tuple[float, float]) -> tuple[str, str] | None:
+    def _find_entity_handle(
+        self, mouse_pos: tuple[float, float]
+    ) -> tuple[str, str] | None:
         document = self._active_document()
         if document is None:
             return None
         best: tuple[str, str] | None = None
         best_distance = 18.0
-        handle_names = {"rect": ["min", "max", "center"], "line": ["start", "end"], "circle": ["radius"], "text": ["position"], "svg": ["min", "max", "center"]}
+        handle_names = {
+            "rect": ["min", "max", "center"],
+            "line": ["start", "end"],
+            "circle": ["radius"],
+            "text": ["position"],
+            "svg": ["min", "max", "center"],
+        }
         for entity in document.entities:
             names = handle_names.get(entity.kind, ["position"])
             for index, point_uv in enumerate(entity_snap_points(entity)[: len(names)]):
-                screen = self._project_world_to_screen(self.sketch_tool.plane_to_world(document.plane, point_uv))
+                screen = self._project_world_to_screen(
+                    self.sketch_tool.plane_to_world(document.plane, point_uv)
+                )
                 if screen is None:
                     continue
-                distance = float(np.linalg.norm(np.asarray(screen, dtype=np.float32) - np.asarray(mouse_pos, dtype=np.float32)))
+                distance = float(
+                    np.linalg.norm(
+                        np.asarray(screen, dtype=np.float32)
+                        - np.asarray(mouse_pos, dtype=np.float32)
+                    )
+                )
                 if distance < best_distance:
-                    best = (entity.entity_id, names[index] if index < len(names) else "position")
+                    best = (
+                        entity.entity_id,
+                        names[index] if index < len(names) else "position",
+                    )
                     best_distance = distance
         return best
 
@@ -1134,7 +1708,7 @@ class TexturePainterApp:
             else:
                 pick = self._pick_result(mouse_pos)
                 if pick is not None:
-                    self._apply_paint_at_pick(pick)
+                    self._apply_paint_at_pick(pick, single_face=True)
                     self._last_brush_face = pick.face_id
             return
         if self._active_document() is None:
@@ -1171,16 +1745,27 @@ class TexturePainterApp:
             if not path:
                 self._set_status("Import/select an SVG first")
                 return
-            entity = self.sketch_tool.create_entity("svg", start_uv, start_uv + np.asarray([0.2, 0.2], dtype=np.float32), self.state.svg_tint)
+            entity = self.sketch_tool.create_entity(
+                "svg",
+                start_uv,
+                start_uv + np.asarray([0.2, 0.2], dtype=np.float32),
+                self.state.svg_tint,
+            )
             entity.data["path"] = path
             entity.data["tint"] = list(self.state.svg_tint)
             self.commands.add_sketch_entity(self._active_document(), entity)
             self._mark_viewport_dirty()
 
-    def _on_mouse_release(self, _sender: int, app_data: tuple[int, float] | int) -> None:
+    def _on_mouse_release(
+        self, _sender: int, app_data: tuple[int, float] | int
+    ) -> None:
         button = app_data[0] if isinstance(app_data, (tuple, list)) else int(app_data)
         if self.state.nav_dragging:
-            if button == 0 and not self.state.nav_drag_moved and self.state.nav_pressed_axis is not None:
+            if (
+                button == 0
+                and not self.state.nav_drag_moved
+                and self.state.nav_pressed_axis is not None
+            ):
                 self._snap_camera_to_axis(self.state.nav_pressed_axis)
             self.state.nav_dragging = False
             self.state.nav_drag_origin = None
@@ -1198,7 +1783,10 @@ class TexturePainterApp:
             and self._active_document() is not None
         ):
             document = self._active_document()
-            if self.state.sketch_tool in {"rect", "line", "circle"} and self.state.drag_origin_plane is not None:
+            if (
+                self.state.sketch_tool in {"rect", "line", "circle"}
+                and self.state.drag_origin_plane is not None
+            ):
                 end_uv = self._screen_hit_on_plane(mouse_pos)
                 if end_uv is not None:
                     entity = self.sketch_tool.create_entity(
@@ -1212,12 +1800,27 @@ class TexturePainterApp:
                     )
                     self.commands.add_sketch_entity(document, entity)
                     self._mark_viewport_dirty()
-            elif self.state.sketch_tool == "select" and self.state.selected_entity_id is not None and self.state.active_handle is not None:
-                entity = next((item for item in document.entities if item.entity_id == self.state.selected_entity_id), None)
+            elif (
+                self.state.sketch_tool == "select"
+                and self.state.selected_entity_id is not None
+                and self.state.active_handle is not None
+            ):
+                entity = next(
+                    (
+                        item
+                        for item in document.entities
+                        if item.entity_id == self.state.selected_entity_id
+                    ),
+                    None,
+                )
                 end_uv = self._screen_hit_on_plane(mouse_pos)
                 if entity is not None and end_uv is not None:
-                    new_data = self.sketch_tool.resize_entity(entity, self.state.active_handle, end_uv)
-                    self.commands.update_sketch_entity(document, entity.entity_id, new_data)
+                    new_data = self.sketch_tool.resize_entity(
+                        entity, self.state.active_handle, end_uv
+                    )
+                    self.commands.update_sketch_entity(
+                        document, entity.entity_id, new_data
+                    )
                     self._mark_viewport_dirty()
         if (
             button == 0
@@ -1233,7 +1836,11 @@ class TexturePainterApp:
         self.state.active_handle = None
 
     def _finish_marquee_selection(self) -> None:
-        if self.mesh_model is None or self.state.marquee_start is None or self.state.marquee_end is None:
+        if (
+            self.mesh_model is None
+            or self.state.marquee_start is None
+            or self.state.marquee_end is None
+        ):
             return
         min_x = min(self.state.marquee_start[0], self.state.marquee_end[0])
         max_x = max(self.state.marquee_start[0], self.state.marquee_end[0])
@@ -1275,12 +1882,18 @@ class TexturePainterApp:
                 self.state.nav_drag_origin = new_origin or self.state.nav_drag_origin
                 self._mark_viewport_dirty()
             return
-        if not self._mouse_inside_viewport() or not self.state.dragging or self.state.drag_origin_screen is None:
+        if (
+            not self._mouse_inside_viewport()
+            or not self.state.dragging
+            or self.state.drag_origin_screen is None
+        ):
             return
         mouse_pos = self._viewport_mouse_position()
         dx = mouse_pos[0] - self.state.drag_origin_screen[0]
         dy = mouse_pos[1] - self.state.drag_origin_screen[1]
-        if self.state.drag_button == 1 or (self.state.workspace_mode == "preview" and self.state.drag_button == 0):
+        if self.state.drag_button == 1 or (
+            self.state.workspace_mode == "preview" and self.state.drag_button == 0
+        ):
             self.camera.orbit(dx * 0.4, -dy * 0.4)
             self.state.drag_origin_screen = mouse_pos
             self._mark_viewport_dirty()
@@ -1352,7 +1965,9 @@ class TexturePainterApp:
             logger.exception("Open failed")
             self._set_status(f"Open failed: {exc} | See log: {log_file_path().name}")
 
-    def _on_apply_scale_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_apply_scale_click(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         if self.mesh_model is None:
             self._set_status("Load a model before scaling")
             return
@@ -1364,7 +1979,9 @@ class TexturePainterApp:
         except Exception as exc:
             self._set_status(f"Scale failed: {exc}")
 
-    def _on_import_variant_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_import_variant_click(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         if self.mesh_model is None:
             self._set_status("Load a base model before importing a variant")
             return
@@ -1398,16 +2015,23 @@ class TexturePainterApp:
         self._push_recent_project(path)
         self._set_status("Saved project .tg3d")
 
-    def _on_open_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_open_click(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         path = self._pick_path_native(
             save=False,
             title="Open model or project",
-            filetypes=[("3D Files", "*.stl *.obj *.glb *.gltf *.tg3d *.json"), ("All files", "*.*")],
+            filetypes=[
+                ("3D Files", "*.stl *.obj *.glb *.gltf *.tg3d *.json"),
+                ("All files", "*.*"),
+            ],
         )
         if path:
             self._on_open_selected(path)
 
-    def _on_export_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_export_click(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         formats = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXPORT_EXTENSIONS))
         path = self._pick_path_native(
             save=True,
@@ -1417,11 +2041,16 @@ class TexturePainterApp:
         if path:
             self._on_export_selected(path)
 
-    def _on_save_project_click(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_save_project_click(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         path = self._pick_path_native(
             save=True,
             title="Save TG3D Project",
-            filetypes=[("Tungsten Project", f"*{PROJECT_EXTENSION}"), ("All files", "*.*")],
+            filetypes=[
+                ("Tungsten Project", f"*{PROJECT_EXTENSION}"),
+                ("All files", "*.*"),
+            ],
         )
         if path:
             if Path(path).suffix.lower() != PROJECT_EXTENSION:
@@ -1445,9 +2074,13 @@ class TexturePainterApp:
 
     def _push_recent_svg(self, path: str) -> None:
         normalized = str(Path(path))
-        self.state.recent_svgs = [item for item in self.state.recent_svgs if item != normalized]
+        self.state.recent_svgs = [
+            item for item in self.state.recent_svgs if item != normalized
+        ]
         self.state.recent_svgs.insert(0, normalized)
-        self.state.recent_svgs = [item for item in self.state.recent_svgs if Path(item).exists()][:10]
+        self.state.recent_svgs = [
+            item for item in self.state.recent_svgs if Path(item).exists()
+        ][:10]
         dpg.configure_item("recent_svg_combo", items=self.state.recent_svgs or [""])
         self._save_svg_settings()
 
@@ -1455,18 +2088,24 @@ class TexturePainterApp:
         if self.mesh_model is None or self._active_document() is None:
             self._set_status("No sketch document to bake")
             return
-        baked = self.sketch_tool.bake_document_to_faces(self.mesh_model, self._active_document())
+        baked = self.sketch_tool.bake_document_to_faces(
+            self.mesh_model, self._active_document()
+        )
         touched = self.commands.paint_faces(baked, description="Bake sketch")
         self._apply_updates(touched)
         self._set_status(f"Baked {len(touched)} face colours")
 
-    def _on_undo(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_undo(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         touched = self.commands.undo()
         self._apply_updates(touched)
         self._refresh_mask_count()
         self._set_status("Undo")
 
-    def _on_redo(self, _sender: int | None = None, _app_data: object | None = None) -> None:
+    def _on_redo(
+        self, _sender: int | None = None, _app_data: object | None = None
+    ) -> None:
         touched = self.commands.redo()
         self._apply_updates(touched)
         self._refresh_mask_count()
@@ -1476,7 +2115,9 @@ class TexturePainterApp:
         if self.mesh_model is None:
             dpg.set_value("mask_count_text", "Masked faces: 0")
             return
-        dpg.set_value("mask_count_text", f"Masked faces: {len(self.mesh_model.masked_faces)}")
+        dpg.set_value(
+            "mask_count_text", f"Masked faces: {len(self.mesh_model.masked_faces)}"
+        )
 
     def _on_clear_mask(self) -> None:
         if self.mesh_model is None or not self.mesh_model.masked_faces:
@@ -1496,6 +2137,19 @@ class TexturePainterApp:
         self._refresh_mask_count()
         self._set_status("Inverted mask")
 
+    def _on_group_faces(self) -> None:
+        if self.mesh_model is None:
+            self._set_status("No mesh loaded")
+            return
+        angle_tolerance = self.state.brush.angle_tolerance_degrees
+        self.mesh_model.compute_face_groups(angle_tolerance_degrees=angle_tolerance)
+        group_count = len(self.mesh_model.face_groups)
+        dpg.set_value("face_groups_count_text", f"Groups: {group_count}")
+        if self.renderer is not None:
+            self.renderer.rebuild_edge_buffer()
+        self._mark_viewport_dirty()
+        self._set_status(f"Created {group_count} face groups")
+
     def _capture_viewport_to_file(self) -> Path:
         self._render_viewport()
         image = (np.clip(self._texture_data, 0.0, 1.0) * 255).astype(np.uint8)
@@ -1504,7 +2158,10 @@ class TexturePainterApp:
         return path
 
     def _refresh_ai_panels(self) -> None:
-        transcript = "\n\n".join(f"{role.upper()}: {content}" for role, content in self.state.ai_messages[-12:])
+        transcript = "\n\n".join(
+            f"{role.upper()}: {content}"
+            for role, content in self.state.ai_messages[-12:]
+        )
         dpg.set_value("ai_chat_transcript", transcript)
         tool_text = "\n".join(
             f"{entry.name} | {'OK' if entry.ok else 'ERR'} | {entry.summary}"
@@ -1513,13 +2170,19 @@ class TexturePainterApp:
         dpg.set_value("ai_tool_log", tool_text)
 
     def _on_ai_send(self) -> None:
-        prompt = str(dpg.get_value("ai_prompt_input")).strip()
-        if not prompt:
-            self._set_status("Enter a prompt for the assistant")
-            return
+        raw_prompt = str(dpg.get_value("ai_prompt_input")).strip()
         self.state.ai_settings.image_path = str(dpg.get_value("ai_image_path")).strip()
+        prompt = build_user_prompt(raw_prompt, self.state.ai_settings.image_path)
+        if not prompt:
+            self._set_status("Enter a prompt or choose a reference image")
+            return
         self._save_ai_settings()
-        self.state.ai_messages.append(("user", prompt))
+        transcript_prompt = (
+            raw_prompt
+            if raw_prompt
+            else "[Image-only request] Recreate the texture from the selected reference image."
+        )
+        self.state.ai_messages.append(("user", transcript_prompt))
         self._refresh_ai_panels()
         try:
             agent = AIAgent(
@@ -1536,7 +2199,9 @@ class TexturePainterApp:
             self.state.ai_messages.append(("assistant", response.text))
             self.state.tool_logs.extend(response.tool_logs)
             if self.renderer is not None and self.mesh_model is not None:
-                self.renderer.update_face_colours(list(range(self.mesh_model.face_count)))
+                self.renderer.update_face_colours(
+                    list(range(self.mesh_model.face_count))
+                )
             self._mark_viewport_dirty()
             self._refresh_ai_panels()
             self._set_status("AI assistant completed")
@@ -1550,6 +2215,7 @@ class TexturePainterApp:
         try:
             while dpg.is_dearpygui_running():
                 self._poll_keyboard_shortcuts()
+                self._sync_workspace_layout()
                 self._render_viewport()
                 dpg.render_dearpygui_frame()
         finally:

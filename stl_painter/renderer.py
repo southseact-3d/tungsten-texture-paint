@@ -387,9 +387,8 @@ class MeshRenderer:
         self._mesh_program["mvp"].write(self._mvp_bytes(camera))
         self._mesh_program["light_dir"].value = tuple(float(v) for v in light_dir)
         self._mesh_vao.render(mode=moderngl.TRIANGLES)
-        if show_triangle_edges:
+        if show_triangle_edges and self._edge_vao is not None:
             assert self._edge_program is not None
-            assert self._edge_vao is not None
             self.ctx.disable(moderngl.CULL_FACE)
             self._edge_program["mvp"].write(self._mvp_bytes(camera))
             self._edge_program["depth_bias"].value = 0.0006

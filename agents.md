@@ -41,6 +41,6 @@
    ```bash   python main.py
    ```
    Then verify you can load the test STL file (`dart.stl`) through the app.
-4. You must always ensure that you fully test your changes and do not stop until the functionality or fix is fully implemented, and you are sure that it will definetely work.
+4. You must always ensure that you fully test your changes and add additional python tests and do not stop until the functionality or fix is fully implemented, and you are sure that it will definetely work.
 
 **Failure to verify STL import after changes may result in the app being unable to load STL files, which is a critical feature.**

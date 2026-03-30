@@ -185,6 +185,8 @@ class PaintTool:
             if front_faces_only and dot < 0.25:
                 continue
             weight = _falloff_weight(distance, radius, falloff) * opacity
+            if face_id == int(center_face_id):
+                weight = max(weight, 1.0)
             if weight <= 0.0:
                 continue
             old_colour = self.mesh_model.face_colour(face_id)

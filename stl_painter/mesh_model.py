@@ -8,7 +8,7 @@ import trimesh
 
 from .color_utils import DEFAULT_COLOR, Color, clamp_color
 
-PROJECT_VERSION = 3
+PROJECT_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -123,6 +123,7 @@ class MeshModel:
     source_path: str | None = None
     face_groups: dict[str, list[int]] = field(default_factory=dict)
     face_to_group: dict[int, str] = field(default_factory=dict)
+    model_scale: float = 1.0
     _adjacency: dict[int, set[int]] | None = field(default=None, init=False, repr=False)
     _mesh_cache: trimesh.Trimesh | None = field(default=None, init=False, repr=False)
     _face_centers: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -139,6 +140,7 @@ class MeshModel:
             for group_id, faces in self.face_groups.items()
         }
         self.face_to_group = {int(face_id): str(group_id) for face_id, group_id in self.face_to_group.items()}
+        self.model_scale = float(self.model_scale)
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError(f"Expected vertices shaped (n, 3), got {self.vertices.shape}")
         if self.faces.ndim != 2 or self.faces.shape[1] != 3:
@@ -169,12 +171,69 @@ class MeshModel:
             lengths = np.linalg.norm(normals, axis=1, keepdims=True)
             safe_lengths = np.where(lengths > 1e-8, lengths, 1.0)
             normals = normals / safe_lengths
+        face_colours: dict[int, Color] = {}
+        face_rgba = getattr(getattr(deduped, "visual", None), "face_colors", None)
+        if face_rgba is not None and len(face_rgba) == len(deduped.faces):
+            raw = np.asarray(face_rgba, dtype=np.uint8)
+            if raw.ndim == 2 and raw.shape[1] >= 3:
+                if raw.shape[1] == 3:
+                    alpha = np.full((raw.shape[0], 1), 255, dtype=np.uint8)
+                    raw = np.hstack([raw, alpha])
+                for face_id, colour in enumerate(raw):
+                    rgba = (int(colour[0]), int(colour[1]), int(colour[2]), int(colour[3]))
+                    if rgba != DEFAULT_COLOR:
+                        face_colours[face_id] = rgba
         return cls(
             vertices=deduped.vertices.view(np.ndarray),
             faces=deduped.faces.view(np.ndarray),
             normals=normals,
+            face_colours=face_colours,
             source_path=source_path,
         )
+
+    def scale_uniform(self, factor: float) -> None:
+        if factor <= 0:
+            raise ValueError("Scale factor must be greater than zero")
+        self.vertices = (self.vertices * float(factor)).astype(np.float32)
+        self.model_scale *= float(factor)
+        self._mesh_cache = None
+        self._face_centers = None
+
+    def map_colours_from(self, source: "MeshModel", *, normalize_scale: bool = True) -> int:
+        if self.face_count == 0 or source.face_count == 0:
+            return 0
+
+        source_centers = source.vertices[source.faces].mean(axis=1).astype(np.float32)
+        target_centers = self.vertices[self.faces].mean(axis=1).astype(np.float32)
+
+        if normalize_scale:
+            src_min = source_centers.min(axis=0)
+            src_extent = np.maximum(source_centers.max(axis=0) - src_min, 1e-6)
+            source_centers = (source_centers - src_min) / src_extent
+
+            tgt_min = target_centers.min(axis=0)
+            tgt_extent = np.maximum(target_centers.max(axis=0) - tgt_min, 1e-6)
+            target_centers = (target_centers - tgt_min) / tgt_extent
+
+        source_colours = np.array(
+            [source.face_colour(face_id) for face_id in range(source.face_count)],
+            dtype=np.int32,
+        )
+        updates = 0
+        chunk_size = 1024
+        for start in range(0, self.face_count, chunk_size):
+            end = min(self.face_count, start + chunk_size)
+            batch = target_centers[start:end]
+            deltas = batch[:, None, :] - source_centers[None, :, :]
+            distances = np.einsum("ijk,ijk->ij", deltas, deltas)
+            nearest = np.argmin(distances, axis=1)
+            for offset, source_face_id in enumerate(nearest):
+                target_face_id = start + offset
+                colour = tuple(int(c) for c in source_colours[int(source_face_id)])
+                if colour != self.face_colour(target_face_id):
+                    self.face_colours[target_face_id] = colour
+                    updates += 1
+        return updates
 
     @property
     def face_count(self) -> int:
@@ -302,6 +361,7 @@ class MeshModel:
             "source_path": self.source_path,
             "face_groups": {group_id: list(faces) for group_id, faces in self.face_groups.items()},
             "face_to_group": {str(face_id): group_id for face_id, group_id in self.face_to_group.items()},
+            "model_scale": self.model_scale,
         }
 
     @classmethod
@@ -335,4 +395,5 @@ class MeshModel:
             source_path=payload.get("source_path"),
             face_groups={str(group_id): [int(face_id) for face_id in faces] for group_id, faces in payload.get("face_groups", {}).items()},
             face_to_group={int(face_id): str(group_id) for face_id, group_id in payload.get("face_to_group", {}).items()},
+            model_scale=float(payload.get("model_scale", 1.0)),
         )

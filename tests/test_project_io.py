@@ -47,3 +47,13 @@ def test_tg3d_round_trip_with_timeline(tmp_path, square_mesh) -> None:
     loaded, loaded_timeline = load_tg3d(path)
     assert loaded.face_count == square_mesh.face_count
     assert int(loaded_timeline["current_index"]) == 1
+
+
+def test_project_round_trip_preserves_model_scale(tmp_path, square_mesh) -> None:
+    square_mesh.scale_uniform(1.75)
+    path = tmp_path / "scaled_project.json"
+
+    save_project(path, square_mesh)
+    loaded = load_project(path)
+
+    assert loaded.model_scale == square_mesh.model_scale

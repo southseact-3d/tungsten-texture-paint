@@ -1,0 +1,12 @@
+{
+  "input": "SR HUT TT120_fixed.stl",
+  "output": "SR_HUT_painted.3mf",
+  "steps": [
+    { "op": "paint-all", "color": "#D2C9B6" },
+    { "op": "paint-region", "min": [-12.5, 90.0, 56.5], "max": [-10.0, 98.3, 74.5], "color": "#529966" },
+    { "op": "paint-region", "min": [-12.5, 99.5, 66.0], "max": [-10.0, 105.5, 73.0], "color": "#529966" },
+    { "op": "paint-region", "min": [-12.5, 115.5, 66.0], "max": [-10.0, 121.5, 73.0], "color": "#529966" },
+    { "op": "screenshot", "path": "SR_HUT_screenshot_1.png", "azimuth": 45, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_screenshot_2.png", "azimuth": 225, "elevation": 20 }
+  ]
+}

@@ -197,6 +197,18 @@ def cmd_export(args: argparse.Namespace) -> None:
     print(f"Exported: {args.output}")
 
 
+def cmd_screenshot(args: argparse.Namespace) -> None:
+    session = CLISession()
+    session.load(args.input)
+    session.screenshot(
+        args.output,
+        azimuth=args.azimuth,
+        elevation=args.elevation,
+        width=args.width,
+        height=args.height,
+    )
+    print(f"Screenshot saved: {args.output}")
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -234,7 +246,16 @@ def _run_pipeline_step(session: CLISession, step: dict[str, Any]) -> str:
         issues = session.export(str(step["path"]))
         ok = all(i == "OK - mesh is valid for export." for i in issues)
         return f"export -> {step['path']}  {'OK' if ok else 'warnings'}"
-    raise ValueError(f"Unknown pipeline op: '{op}'. Valid ops: paint-all, paint-face, flood-fill, paint-group, paint-region, save, export")
+    if op == "screenshot":
+        session.screenshot(
+            str(step["path"]),
+            azimuth=float(step.get("azimuth", 45.0)),
+            elevation=float(step.get("elevation", 45.0)),
+            width=int(step.get("width", 800)),
+            height=int(step.get("height", 600)),
+        )
+        return f"screenshot -> {step['path']}"
+    raise ValueError(f"Unknown pipeline op: '{op}'. Valid ops: paint-all, paint-face, flood-fill, paint-group, paint-region, save, export, screenshot")
 
 
 def cmd_pipeline(args: argparse.Namespace) -> None:
@@ -402,6 +423,15 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--input", "-i", required=True, metavar="PATH")
     p_exp.add_argument("--output", "-o", required=True, metavar="PATH")
 
+    # screenshot -------------------------------------------------------------
+    p_ss = sub.add_parser("screenshot", help="Take a software-rendered screenshot of the mesh")
+    p_ss.add_argument("--input", "-i", required=True, metavar="PATH")
+    p_ss.add_argument("--output", "-o", required=True, metavar="PATH", help="Output PNG path")
+    p_ss.add_argument("--azimuth", type=float, default=45.0, help="Camera azimuth angle")
+    p_ss.add_argument("--elevation", type=float, default=45.0, help="Camera elevation angle")
+    p_ss.add_argument("--width", type=int, default=800, help="Image width")
+    p_ss.add_argument("--height", type=int, default=600, help="Image height")
+
     # pipeline ---------------------------------------------------------------
     p_pl = sub.add_parser(
         "pipeline",
@@ -449,6 +479,7 @@ _COMMANDS = {
     "list-groups": cmd_list_groups,
     "save": cmd_save,
     "export": cmd_export,
+    "screenshot": cmd_screenshot,
     "pipeline": cmd_pipeline,
 }
 

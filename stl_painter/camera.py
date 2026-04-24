@@ -61,12 +61,12 @@ class OrbitCamera:
         azimuth = radians(self.azimuth)
         elevation = radians(self.elevation)
         x = self.distance * cos(elevation) * cos(azimuth)
-        y = self.distance * sin(elevation)
-        z = self.distance * cos(elevation) * sin(azimuth)
+        y = self.distance * cos(elevation) * sin(azimuth)
+        z = self.distance * sin(elevation)
         return self.target + np.array([x, y, z], dtype=np.float32)
 
     def view_matrix(self) -> np.ndarray:
-        return look_at(self.position(), self.target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+        return look_at(self.position(), self.target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
 
     def projection_matrix(self, viewport_size: tuple[int, int]) -> np.ndarray:
         width, height = viewport_size
@@ -90,7 +90,7 @@ class OrbitCamera:
     def pan(self, delta_x: float, delta_y: float) -> None:
         eye = self.position()
         forward = _normalize(self.target - eye)
-        right = _normalize(np.cross(forward, np.array([0.0, 1.0, 0.0], dtype=np.float32)))
+        right = _normalize(np.cross(forward, np.array([0.0, 0.0, 1.0], dtype=np.float32)))
         up = _normalize(np.cross(right, forward))
         scale = self.distance * 0.0025
         offset = (-right * delta_x + up * delta_y) * scale

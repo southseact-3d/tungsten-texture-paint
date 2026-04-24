@@ -1,0 +1,20 @@
+{
+  "input": "SR HUT TT120_fixed.stl",
+  "output": "SR_HUT_painted.3mf",
+  "steps": [
+    { "op": "paint-all", "color": "#D2C9B6" },
+    
+    {"op": "paint-region", "min": [-18.5, 90.0, 56.5], "max": [-11.5, 91.0, 74.5], "color": "#529966"},
+    
+    {"op": "paint-region", "min": [-11.5, 116.0, 66.5], "max": [-10.95, 121.0, 72.5], "color": "#529966"},
+    {"op": "paint-region", "min": [-11.5, 100.0, 66.5], "max": [-10.95, 105.0, 72.5], "color": "#529966"},
+    
+    {"op": "paint-region", "min": [-17.5, 122.0, 66.5], "max": [-12.5, 122.55, 72.5], "color": "#529966"},
+    {"op": "paint-region", "min": [-31.0, 122.0, 66.5], "max": [-26.0, 122.55, 72.5], "color": "#529966"},
+    
+    { "op": "screenshot", "path": "SR_HUT_ultra_1.png", "azimuth": 45, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_ultra_2.png", "azimuth": 135, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_ultra_3.png", "azimuth": 225, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_ultra_4.png", "azimuth": 315, "elevation": 20 }
+  ]
+}

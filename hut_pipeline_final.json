@@ -1,0 +1,16 @@
+{
+  "input": "SR HUT TT120_fixed.stl",
+  "output": "SR_HUT_painted.3mf",
+  "steps": [
+    { "op": "paint-all", "color": "#D2C9B6" },
+    { "op": "paint-group", "group": "group_64", "color": "#529966" },
+    { "op": "paint-group", "group": "group_62", "color": "#529966" },
+    { "op": "paint-group", "group": "group_63", "color": "#529966" },
+    { "op": "paint-group", "group": "group_105", "color": "#529966" },
+    { "op": "paint-group", "group": "group_106", "color": "#529966" },
+    { "op": "screenshot", "path": "SR_HUT_final_1.png", "azimuth": 45, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_final_2.png", "azimuth": 135, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_final_3.png", "azimuth": 225, "elevation": 20 },
+    { "op": "screenshot", "path": "SR_HUT_final_4.png", "azimuth": 315, "elevation": 20 }
+  ]
+}

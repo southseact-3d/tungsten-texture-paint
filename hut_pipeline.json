@@ -1,0 +1,10 @@
+{
+  "input": "SR HUT TT120_fixed.stl",
+  "output": "SR_HUT_painted.3mf",
+  "steps": [
+    { "op": "paint-all", "color": "#D2C9B6" },
+    { "op": "paint-region", "min": [-35, 91.0, 56.5], "max": [-9, 98.5, 74.0], "color": "#529966" },
+    { "op": "paint-region", "min": [-35, 99.8, 66.5], "max": [-9, 105.2, 72.5], "color": "#529966" },
+    { "op": "paint-region", "min": [-35, 115.8, 66.5], "max": [-9, 121.0, 72.5], "color": "#529966" }
+  ]
+}

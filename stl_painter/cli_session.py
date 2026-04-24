@@ -79,6 +79,20 @@ class CLISession:
         from .exporter import export_model
         return export_model(Path(path), self._require_mesh())
 
+    def screenshot(self, path: str | Path, azimuth: float = 45.0, elevation: float = 45.0, width: int = 800, height: int = 600) -> None:
+        """Render a screenshot using the software fallback renderer and save to path."""
+        from PIL import Image
+        from .camera import OrbitCamera
+        from .renderer import MeshRenderer
+        mesh = self._require_mesh()
+        camera = OrbitCamera.for_mesh(mesh.vertices)
+        camera.set_angles(azimuth, elevation)
+        # Use software rendering so it works fully headless without an OpenGL context
+        renderer = MeshRenderer(None, mesh, (width, height), prefer_gpu=False)
+        snapshot = renderer.render(camera)
+        img = Image.fromarray(snapshot.rgba, "RGBA")
+        img.save(path)
+
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------

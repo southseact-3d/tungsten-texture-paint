@@ -183,17 +183,18 @@ Loads a mesh and saves it as a `.tg3d` project.  Useful for creating a base proj
 
 ---
 
-### `export` — export to 3MF / STL / OBJ / GLB
+### `export`
+Exports the painted model to a final format (e.g., `.3mf`, `.obj`, `.stl`, `.glb`).
 
+```bash
+tgpaint export --input painted.tg3d --output final.3mf
 ```
-tgpaint export --input <FILE> --output <OUT>
-```
 
-Supported output formats: `.3mf`, `.stl`, `.obj`, `.ply`, `.glb`, `.gltf`.
+### `screenshot`
+Renders a software-based screenshot of the painted mesh, useful for AI visual feedback or documentation. It does not require a GPU or GUI to function.
 
-**Example:**
-```powershell
-tgpaint export --input dart_painted.tg3d --output dart_painted.3mf
+```bash
+tgpaint screenshot --input painted.tg3d --output view.png --azimuth 45 --elevation 30 --width 800 --height 600
 ```
 
 ---
@@ -215,9 +216,9 @@ A pipeline JSON file describes an ordered list of operations:
     { "op": "paint-all",    "color": "#B0B8C4" },
     { "op": "flood-fill",   "face_id": 42,   "color": "#FF3300" },
     { "op": "paint-group",  "group": "group_3", "color": "#0055AA", "angle": 20 },
-    { "op": "paint-region", "min": [0,0,0], "max": [20,20,50], "color": "#FFAA00" },
-    { "op": "save",         "path": "checkpoint.tg3d" },
-    { "op": "export",       "path": "result.3mf" }
+    { "op": "paint-region", "min": [0,0,0], "max": [10,10,10], "color": "#0000FF" },
+    { "op": "screenshot", "path": "preview.png", "azimuth": 45, "elevation": 30 },
+    { "op": "export", "path": "final_model.3mf" }
   ]
 }
 ```

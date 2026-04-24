@@ -1,19 +1,17 @@
 # STL Texture Painter
 
-Desktop Python app for loading STL meshes, painting per-face colours, sketching viewport overlays, baking those overlays to triangle colours, exporting in common 3D formats, and saving timeline-aware `.tg3d` projects.
+A desktop Python application for painting colors onto 3D STL meshes and exporting them for 3D printing.
 
-## What is implemented
+## Features
 
-- Milestone 1: STL import, central mesh model, orbit camera, ModernGL off-screen renderer, Dear PyGui app shell
-- Milestone 2: CPU ray picking with GPU-picking fallback, per-face paint updates, palette and custom colour picker
-- Milestone 3: flood fill, undo stack, drag-to-paint support
-- Milestone 4: 3MF export with `m:colorgroup` triangle colour assignment and mesh validation
-- Milestone 5: sketch overlay primitives for text, rectangles, lines, and freehand strokes
-- Milestone 6: sketch baking from viewport projection into per-face colours
-- Milestone 7: mesh validation messaging, GPU picking path, project save/load JSON
-- Milestone 8: native file dialogs, timeline slider, Ctrl+Z/Ctrl+Shift+Z, multi-format export (`3mf`, `obj`, `glb`, `gltf`, `stl`, `ply`, `fbx`), `.tg3d` project format
+- **STL Import** - Load and validate STL mesh files
+- **Per-Face Painting** - Paint individual triangles with colors using a palette or custom color picker
+- **Sketch Overlays** - Draw text, rectangles, lines, and freehand strokes on the 3D viewport
+- **Sketch Baking** - Project sketch overlays onto the mesh as per-face colors
+- **Multi-Format Export** - Export painted meshes as 3MF, OBJ, GLB, GLTF, STL, PLY, or FBX
+- **Project Save/Load** - Save and load `.tg3d` projects with undo/redo support
 
-## Run locally
+## Run Locally
 
 ```bash
 python -m venv .venv
@@ -30,5 +28,4 @@ pytest
 
 ## Notes
 
-- Put a font such as `DejaVuSans.ttf` into [`stl_painter/assets/README.txt`](c:/Users/liamh/Downloads/ai%20-%202/texture%20paint/stl_painter/assets/README.txt)'s folder for bundled text rendering. The app falls back to common system fonts when possible.
-- The GUI uses an off-screen ModernGL renderer and Dear PyGui texture presentation so CI can still validate the non-GUI pipeline through unit tests and package builds.
+- Place a font file such as `DejaVuSans.ttf` in the `stl_painter/assets/` folder for text rendering support. The app falls back to system fonts when not available.

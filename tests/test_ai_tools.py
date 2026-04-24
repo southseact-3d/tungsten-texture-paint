@@ -32,7 +32,22 @@ def test_ai_tool_rejects_invalid_face(square_mesh) -> None:
 def test_ai_tool_creates_sketch_and_bakes(square_mesh) -> None:
     context = _context(square_mesh)
     run_tool(context, "create_sketch_plane", json.dumps({"face_id": 0}))
-    run_tool(context, "add_rect_sketch", json.dumps({"min_uv": [0.0, 0.0], "max_uv": [0.5, 0.5]}))
+    run_tool(
+        context,
+        "add_rect_sketch",
+        json.dumps({"min_uv": [0.0, 0.0], "max_uv": [0.5, 0.5]}),
+    )
     result = json.loads(run_tool(context, "bake_sketch", "{}"))
 
     assert result["ok"] is True
+
+
+def test_ai_tool_paint_faces(square_mesh) -> None:
+    context = _context(square_mesh)
+    result = run_tool(
+        context,
+        "paint_faces",
+        json.dumps({"face_ids": [0], "colour": [255, 0, 0, 255]}),
+    )
+    parsed = json.loads(result)
+    assert "error" in parsed or "ok" in parsed

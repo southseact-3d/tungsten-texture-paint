@@ -1,0 +1,9 @@
+{
+  "ai_settings": {
+    "provider_base_url": "https://llm.chutes.ai/v1",
+    "api_key": "cpk_5157f051821d4211954806e798e7e3a3.8e53da20a2eb5bb1a6bead83fb7db069.qwtstSZGu2dfNy35HOBWq1433KFY0h6b",
+    "model": "chutesai/Mistral-Small-3.1-24B-Instruct-2503-TEE",
+    "timeout": 120.0,
+    "image_path": "C:/Users/liamh/Downloads/images.jpg"
+  }
+}

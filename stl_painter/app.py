@@ -61,21 +61,21 @@ PALETTE: list[Color] = [
 ]
 
 ICON = {
-    "open": "📂",
-    "export": "📤",
-    "save": "💾",
-    "bake": "🔥",
-    "undo": "↶",
-    "redo": "↷",
-    "clear": "🧹",
-    "invert": "🔁",
-    "paint": "🖌",
-    "mask": "🎭",
-    "select": "🔲",
-    "image": "🖼",
-    "send": "✉",
-    "svg": "📐",
-    "group": "🔗",
+    "open": "Open",
+    "export": "Export",
+    "save": "Save",
+    "bake": "Bake",
+    "undo": "Undo",
+    "redo": "Redo",
+    "clear": "Clear",
+    "invert": "Invert",
+    "paint": "Paint",
+    "mask": "Mask",
+    "select": "Select",
+    "image": "Image",
+    "send": "Send",
+    "svg": "SVG",
+    "group": "Group",
 }
 
 
@@ -111,6 +111,7 @@ class TexturePainterApp:
             dtype=np.float32,
         )
         self._last_brush_face: int | None = None
+        self._timeline_context_index: int = 0
         self._load_ai_settings()
         self._load_svg_settings()
         self._load_recent_projects()
@@ -218,7 +219,7 @@ class TexturePainterApp:
             height=520,
             show=False,
         ):
-            dpg.add_text("Welcome to Tungsten Texture Paint", color=(33, 55, 102))
+            dpg.add_text("Welcome to Tungsten Texture Paint", color=(17, 24, 39))
             dpg.add_text(
                 "Open a model/project or continue from a recent .tg3d session.",
                 wrap=680,
@@ -226,7 +227,7 @@ class TexturePainterApp:
             dpg.add_separator()
             with dpg.group(horizontal=True):
                 dpg.add_button(
-                    label=f"{ICON['open']} Open Model / Project",
+                    label="Open Model / Project",
                     callback=self._on_open_click,
                     width=220,
                 )
@@ -236,7 +237,7 @@ class TexturePainterApp:
                     width=180,
                 )
             dpg.add_spacer(height=8)
-            dpg.add_text("Recent Projects", color=(33, 55, 102))
+            dpg.add_text("Recent Projects", color=(17, 24, 39))
             dpg.add_listbox(
                 items=self.state.recent_projects or ["No recent projects yet"],
                 tag="recent_projects_list",
@@ -256,37 +257,32 @@ class TexturePainterApp:
                 )
         with dpg.window(label="STL Texture Painter", tag="main_window", show=False):
             with dpg.group(horizontal=True):
-                dpg.add_button(
-                    label="Recent Projects",
-                    callback=self._show_home_window,
-                    width=130,
-                )
-                dpg.add_button(
-                    label=f"{ICON['open']} Open STL / Project",
-                    callback=self._on_open_click,
-                    width=180,
-                )
-                dpg.add_button(
-                    label=f"{ICON['export']} Export Model",
-                    callback=self._on_export_click,
-                    width=130,
-                )
-                dpg.add_button(
-                    label=f"{ICON['save']} Save Project",
-                    callback=self._on_save_project_click,
-                    width=140,
-                )
-                dpg.add_button(
-                    label=f"{ICON['bake']} Bake Sketch",
-                    callback=self._on_bake_sketch,
-                    width=130,
-                )
-                dpg.add_button(
-                    label=f"{ICON['undo']} Undo", callback=self._on_undo, width=90
-                )
-                dpg.add_button(
-                    label=f"{ICON['redo']} Redo", callback=self._on_redo, width=90
-                )
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="Open",
+                        callback=self._on_open_click,
+                        width=70,
+                    )
+                    dpg.add_button(
+                        label="Export",
+                        callback=self._on_export_click,
+                        width=70,
+                    )
+                    dpg.add_button(
+                        label="Save",
+                        callback=self._on_save_project_click,
+                        width=70,
+                    )
+                    dpg.add_button(
+                        label="Bake",
+                        callback=self._on_bake_sketch,
+                        width=70,
+                    )
+                dpg.add_spacer(width=12)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Undo", callback=self._on_undo, width=70)
+                    dpg.add_button(label="Redo", callback=self._on_redo, width=70)
+                dpg.add_spacer(width=12)
                 dpg.add_text("Preview Mode", tag="workspace_mode_label")
                 dpg.add_text("", tag="status_text")
             dpg.add_separator()
@@ -328,17 +324,7 @@ class TexturePainterApp:
                         dpg.add_key_release_handler(callback=self._on_key_release)
                 self._build_right_sidebar()
             dpg.add_separator()
-            dpg.add_text("Timeline")
-            dpg.add_slider_int(
-                label="History",
-                tag="timeline_slider",
-                min_value=0,
-                max_value=0,
-                default_value=0,
-                callback=self._on_timeline_change,
-                width=-1,
-            )
-            dpg.add_text("Step 0/0 | Initial state", tag="timeline_status")
+            self._build_timeline_panel()
         dpg.create_viewport(title="STL Texture Painter", width=1680, height=920)
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -350,44 +336,97 @@ class TexturePainterApp:
     def _apply_light_theme(self) -> None:
         with dpg.theme(tag="light_app_theme"):
             with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 12)
-                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 6)
-                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 8)
-                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 8)
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6)
-                dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 6)
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (246, 248, 252, 255))
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 10, 10)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 5)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_TabRounding, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_ScrollbarRounding, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 6)
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (245, 247, 250, 255))
                 dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (255, 255, 255, 255))
                 dpg.add_theme_color(dpg.mvThemeCol_PopupBg, (255, 255, 255, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (240, 244, 250, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (229, 238, 250, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (217, 232, 252, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (64, 123, 255, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (48, 107, 232, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (38, 88, 204, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Header, (219, 232, 255, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (204, 223, 252, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (186, 212, 252, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (238, 242, 248, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (228, 235, 248, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (215, 228, 250, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (59, 130, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (37, 99, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (29, 78, 216, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (219, 234, 254, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (191, 219, 254, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (147, 197, 253, 255))
                 dpg.add_theme_color(dpg.mvThemeCol_Text, (31, 41, 55, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Separator, (206, 216, 230, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Separator, (203, 213, 225, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Tab, (243, 244, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (229, 231, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TabActive, (229, 231, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBg, (243, 244, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (243, 244, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_MenuBarBg, (249, 250, 251, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg, (243, 244, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab, (203, 213, 225, 255))
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_ScrollbarGrabHovered, (148, 163, 184, 255)
+                )
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_ScrollbarGrabActive, (107, 114, 128, 255)
+                )
+                dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (59, 130, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (59, 130, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (37, 99, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, (243, 244, 246, 255))
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_TableBorderStrong, (203, 213, 225, 255)
+                )
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_TableBorderLight, (229, 231, 235, 255)
+                )
+            with dpg.theme_component(dpg.mvButton, tag="toolbar_button_theme"):
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 10, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemInnerSpacing, 8, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (243, 244, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (229, 231, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (209, 213, 219, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (31, 41, 55, 255))
+            with dpg.theme_component(dpg.mvButton, tag="primary_button_theme"):
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 10, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (59, 130, 246, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (37, 99, 235, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (29, 78, 216, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255, 255))
+            with dpg.theme_component(dpg.mvText, tag="section_header_theme"):
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (17, 24, 39, 255))
+            with dpg.theme_component(dpg.mvText, tag="hint_text_theme"):
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (107, 114, 128, 255))
         dpg.bind_theme("light_app_theme")
 
     def _load_default_font(self) -> None:
         font_candidates = [
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "C:\\Windows\\Fonts\\calibri.ttf",
+            "/System/Library/Fonts/SF Pro Text.ttc",
+            "/System/Library/Fonts/Helvetica.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
         ]
-        for font_path in font_candidates:
-            if Path(font_path).exists():
-                with dpg.font_registry():
-                    font_id = dpg.add_font(font_path, 17)
-                dpg.bind_font(font_id)
-                return
+        with dpg.font_registry():
+            for font_path in font_candidates:
+                if Path(font_path).exists():
+                    font_id = dpg.add_font(font_path, 18)
+                    dpg.bind_font(font_id)
+                    return
+            font_id = dpg.add_font(dpg.mvFont_None, 18)
+            dpg.bind_font(font_id)
 
     def _build_left_sidebar(self) -> None:
         with dpg.child_window(width=300, height=-1, tag="tools_panel"):
-            dpg.add_text("Workspace", color=(33, 55, 102))
+            dpg.add_text("Workspace", color=(17, 24, 39))
             dpg.add_combo(
                 items=["paint", "sketch"],
                 default_value=self.state.interaction_mode,
@@ -396,7 +435,7 @@ class TexturePainterApp:
                 tag="interaction_mode_combo",
             )
             dpg.add_separator()
-            dpg.add_text("Colour", color=(33, 55, 102))
+            dpg.add_text("Colour", color=(17, 24, 39))
             dpg.add_text("No mesh loaded", tag="mesh_info_text", wrap=260)
             with dpg.group(horizontal=True):
                 for index, colour in enumerate(PALETTE):
@@ -416,7 +455,7 @@ class TexturePainterApp:
                 alpha_bar=True,
             )
             dpg.add_separator()
-            dpg.add_text("Model Transform", color=(33, 55, 102))
+            dpg.add_text("Model Transform", color=(17, 24, 39))
             dpg.add_input_float(
                 label="Scale Multiple",
                 default_value=1.0,
@@ -434,7 +473,7 @@ class TexturePainterApp:
             )
             with dpg.group(tag="paint_section"):
                 dpg.add_separator()
-                dpg.add_text("Paint Tools", color=(33, 55, 102))
+                dpg.add_text("Paint Tools", color=(17, 24, 39))
                 dpg.add_combo(
                     items=["brush", "fill", "sample", "erase", "mask", "select"],
                     default_value=self.state.paint_tool,
@@ -492,33 +531,33 @@ class TexturePainterApp:
                     ),
                 )
                 dpg.add_button(
-                    label=f"{ICON['group']} Group Faces",
+                    label="Group Faces",
                     callback=self._on_group_faces,
                     width=-1,
                 )
                 dpg.add_text("Groups: 0", tag="face_groups_count_text")
                 dpg.add_button(
-                    label=f"{ICON['clear']} Clear Mask",
+                    label="Clear Mask",
                     callback=self._on_clear_mask,
                     width=-1,
                 )
                 dpg.add_button(
-                    label=f"{ICON['invert']} Invert Mask",
+                    label="Invert Mask",
                     callback=self._on_invert_mask,
                     width=-1,
                 )
                 dpg.add_button(
-                    label=f"{ICON['paint']} Paint Selected",
+                    label="Paint Selected",
                     callback=self._paint_selected_faces,
                     width=-1,
                 )
                 dpg.add_button(
-                    label=f"{ICON['mask']} Mask Selected",
+                    label="Mask Selected",
                     callback=self._mask_selected_faces,
                     width=-1,
                 )
                 dpg.add_button(
-                    label=f"{ICON['select']} Clear Selection",
+                    label="Clear Selection",
                     callback=self._clear_face_selection,
                     width=-1,
                 )
@@ -526,7 +565,7 @@ class TexturePainterApp:
                 dpg.add_text("Selected faces: 0", tag="selected_count_text")
             with dpg.group(tag="sketch_section", show=False):
                 dpg.add_separator()
-                dpg.add_text("Sketch Tools", color=(33, 55, 102))
+                dpg.add_text("Sketch Tools", color=(17, 24, 39))
                 dpg.add_combo(
                     items=["select", "line", "rect", "circle", "text", "svg"],
                     default_value=self.state.sketch_tool,
@@ -535,7 +574,7 @@ class TexturePainterApp:
                     tag="sketch_tool_combo",
                 )
                 dpg.add_button(
-                    label=f"{ICON['svg']} Import SVG",
+                    label="Import SVG",
                     callback=lambda: dpg.show_item("svg_dialog"),
                     width=-1,
                 )
@@ -597,7 +636,7 @@ class TexturePainterApp:
 
     def _build_right_sidebar(self) -> None:
         with dpg.child_window(width=360, height=-1, tag="ai_panel"):
-            dpg.add_text("AI Assistant", color=(33, 55, 102))
+            dpg.add_text("AI Assistant", color=(17, 24, 39))
             dpg.add_text(
                 "Prompt is optional. If you provide only a reference image, the assistant will try to recreate that texture.",
                 wrap=320,
@@ -637,12 +676,12 @@ class TexturePainterApp:
                 tag="ai_image_path",
             )
             dpg.add_button(
-                label=f"{ICON['image']} Choose Image",
+                label="Choose Image",
                 callback=lambda: dpg.show_item("image_dialog"),
                 width=-1,
             )
             dpg.add_separator()
-            dpg.add_text("Optional Prompt", color=(33, 55, 102))
+            dpg.add_text("Optional Prompt", color=(17, 24, 39))
             dpg.add_input_text(
                 multiline=True,
                 height=150,
@@ -650,7 +689,7 @@ class TexturePainterApp:
                 tag="ai_prompt_input",
             )
             dpg.add_button(
-                label=f"{ICON['send']} Send To Assistant",
+                label="Send To Assistant",
                 callback=self._on_ai_send,
                 width=-1,
             )
@@ -1296,6 +1335,211 @@ class TexturePainterApp:
             descriptions[min(current, max_index)] if descriptions else "Initial state"
         )
         dpg.set_value("timeline_status", f"Step {current}/{max_index} | {current_desc}")
+        self._draw_timeline()
+
+    def _build_timeline_panel(self) -> None:
+        with dpg.child_window(
+            height=110,
+            border=True,
+            tag="timeline_panel",
+            no_scrollbar=False,
+        ):
+            with dpg.group(horizontal=True):
+                dpg.add_text("History", color=(55, 65, 81))
+                dpg.add_text("", tag="timeline_status")
+            dpg.add_spacer(height=4)
+            dpg.add_drawlist(
+                width=-1,
+                height=50,
+                tag="timeline_drawlist",
+            )
+            dpg.add_slider_int(
+                tag="timeline_slider",
+                min_value=0,
+                max_value=0,
+                default_value=0,
+                callback=self._on_timeline_change,
+                width=-1,
+            )
+            with dpg.handler_registry(tag="timeline_handler"):
+                dpg.add_mouse_click_handler(
+                    button=dpg.mvMouseButton_Right,
+                    callback=self._on_timeline_right_click,
+                )
+        dpg.add_text("", tag="timeline_message")
+
+    def _draw_timeline(self) -> None:
+        if not dpg.does_item_exist("timeline_drawlist"):
+            return
+        dpg.delete_item("timeline_drawlist", children_only=True)
+        descriptions = self.commands.timeline_descriptions()
+        current = self.commands.timeline_index()
+        if not descriptions:
+            descriptions = ["Initial state"]
+            current = 0
+        drawlist_width = dpg.get_item_rect_size("timeline_drawlist")[0]
+        if drawlist_width <= 0:
+            drawlist_width = 800
+        item_width = max(
+            60, min(120, (drawlist_width - 40) // max(1, len(descriptions)))
+        )
+        total_width = item_width * len(descriptions)
+        start_x = max(20, (drawlist_width - total_width) // 2)
+        y_center = 25
+        y_top = 8
+        y_bottom = 42
+        for i, desc in enumerate(descriptions):
+            x = start_x + i * item_width
+            is_current = i == current
+            is_past = i < current
+            if is_current:
+                fill_colour = (59, 130, 246, 255)
+                text_colour = (255, 255, 255, 255)
+                border_colour = (37, 99, 235, 255)
+            elif is_past:
+                fill_colour = (219, 234, 254, 255)
+                text_colour = (31, 41, 55, 255)
+                border_colour = (147, 197, 253, 255)
+            else:
+                fill_colour = (243, 244, 246, 255)
+                text_colour = (107, 114, 128, 255)
+                border_colour = (209, 213, 219, 255)
+            rect_x1 = x + 2
+            rect_y1 = y_top
+            rect_x2 = x + item_width - 2
+            rect_y2 = y_bottom
+            dpg.draw_rectangle(
+                [rect_x1, rect_y1],
+                [rect_x2, rect_y2],
+                fill=fill_colour,
+                color=border_colour,
+                thickness=2,
+                rounding=4,
+                parent="timeline_drawlist",
+            )
+            short_desc = desc[:12] if len(desc) > 12 else desc
+            text_width = len(short_desc) * 5
+            text_x = x + (item_width - text_width) // 2
+            dpg.draw_text(
+                (text_x, y_center - 6),
+                short_desc,
+                color=text_colour,
+                size=14,
+                parent="timeline_drawlist",
+            )
+            if i < len(descriptions) - 1:
+                line_start_x = x + item_width
+                line_end_x = x + item_width + 2
+                dpg.draw_line(
+                    (line_start_x, y_center),
+                    (line_end_x, y_center),
+                    color=(148, 163, 184, 180),
+                    thickness=2,
+                    parent="timeline_drawlist",
+                )
+        arrow_x = start_x + current * item_width + item_width // 2
+        arrow_y = y_bottom + 2
+        dpg.draw_triangle(
+            (arrow_x - 5, arrow_y),
+            (arrow_x + 5, arrow_y),
+            (arrow_x, arrow_y + 6),
+            fill=(59, 130, 246, 255),
+            color=(37, 99, 235, 255),
+            thickness=1,
+            parent="timeline_drawlist",
+        )
+
+    def _on_timeline_right_click(self, _sender: int, _app_data: object) -> None:
+        if not dpg.does_item_exist("timeline_drawlist"):
+            return
+        if not dpg.is_item_hovered("timeline_drawlist"):
+            return
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=True)
+        descriptions = self.commands.timeline_descriptions()
+        if not descriptions:
+            descriptions = ["Initial state"]
+        drawlist_width = dpg.get_item_rect_size("timeline_drawlist")[0]
+        if drawlist_width <= 0:
+            drawlist_width = 800
+        item_width = max(
+            60, min(120, (drawlist_width - 40) // max(1, len(descriptions)))
+        )
+        total_width = item_width * len(descriptions)
+        start_x = max(20, (drawlist_width - total_width) // 2)
+        clicked_index = int((mouse_x - start_x) // item_width)
+        if clicked_index < 0 or clicked_index >= len(descriptions):
+            return
+        self._timeline_context_index = clicked_index
+        if dpg.does_item_exist("timeline_context_menu"):
+            dpg.delete_item("timeline_context_menu")
+        with dpg.window(
+            tag="timeline_context_menu",
+            label="",
+            no_title_bar=True,
+            no_move=False,
+            no_resize=True,
+            popup=True,
+            autosize=True,
+            no_scrollbar=True,
+        ):
+            dpg.add_text(f"Action: {descriptions[clicked_index]}", color=(55, 65, 81))
+            dpg.add_separator()
+            dpg.add_menu_item(
+                label="Jump to here",
+                callback=lambda: self._timeline_jump_to(self._timeline_context_index),
+            )
+            current = self.commands.timeline_index()
+            if clicked_index < current:
+                dpg.add_menu_item(
+                    label="Undo to here",
+                    callback=lambda: self._timeline_undo_to(
+                        self._timeline_context_index
+                    ),
+                )
+            if clicked_index > current:
+                dpg.add_menu_item(
+                    label="Redo to here",
+                    callback=lambda: self._timeline_redo_to(
+                        self._timeline_context_index
+                    ),
+                )
+            if clicked_index > 0:
+                dpg.add_menu_item(
+                    label="Undo this action",
+                    callback=lambda: self._timeline_undo_one(
+                        self._timeline_context_index
+                    ),
+                )
+        dpg.configure_item("timeline_context_menu", pos=[mouse_x, mouse_y])
+        dpg.show_item("timeline_context_menu")
+
+    def _timeline_jump_to(self, index: int) -> None:
+        touched = self.commands.jump_to_timeline_index(index)
+        self._apply_updates(touched)
+        self._refresh_mask_count()
+        self._set_status(f"Jumped to step {index}")
+
+    def _timeline_undo_to(self, index: int) -> None:
+        touched = self.commands.jump_to_timeline_index(index)
+        self._apply_updates(touched)
+        self._refresh_mask_count()
+        self._set_status(f"Undid to step {index}")
+
+    def _timeline_redo_to(self, index: int) -> None:
+        touched = self.commands.jump_to_timeline_index(index)
+        self._apply_updates(touched)
+        self._refresh_mask_count()
+        self._set_status(f"Redid to step {index}")
+
+    def _timeline_undo_one(self, index: int) -> None:
+        current = self.commands.timeline_index()
+        if index == current:
+            self._on_undo()
+        else:
+            touched = self.commands.jump_to_timeline_index(index - 1)
+            self._apply_updates(touched)
+            self._refresh_mask_count()
+            self._set_status(f"Undid action at step {index}")
 
     def _render_snapshot(self) -> RenderSnapshot:
         if self.mesh_model is None or self.renderer is None:

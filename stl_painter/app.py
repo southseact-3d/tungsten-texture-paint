@@ -832,8 +832,8 @@ class TexturePainterApp:
             "center": (width / 2.0, height / 2.0),
             "radius": 44.0,
             "orbit_radius": 34.0,
-            "axis_length": 32.0,
-            "handle_radius": 14.0,
+            "axis_length": 28.0,
+            "handle_radius": 10.0,
         }
 
     def _nav_axis_items(self) -> list[dict[str, object]]:
@@ -961,13 +961,13 @@ class TexturePainterApp:
                     thickness=2,
                     parent="viewport_nav_pad",
                 )
-                dpg.draw_text(
-                    (point[0] - 6, point[1] - 10),
-                    item["label"],
-                    color=(255, 255, 255, 255),
-                    size=18,
-                    parent="viewport_nav_pad",
-                )
+            dpg.draw_text(
+                (point[0] - 4, point[1] - 7),
+                item["label"],
+                color=(255, 255, 255, 255),
+                size=12,
+                parent="viewport_nav_pad",
+            )
             else:
                 radius_px = 11 if hovered else 9
                 dpg.draw_circle(

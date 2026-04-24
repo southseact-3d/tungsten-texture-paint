@@ -157,13 +157,22 @@ class CLISession:
         min_xyz: tuple[float, float, float],
         max_xyz: tuple[float, float, float],
         colour: Color,
+        strict: bool = False,
     ) -> list[int]:
-        """Paint all faces whose centroid falls within the given 3D bounding box."""
+        """Paint all faces whose centroid falls within the given 3D bounding box.
+        If strict is True, ALL 3 vertices of the face must be inside the box.
+        """
         mesh = self._require_mesh()
-        centroids = mesh.vertices[mesh.faces].mean(axis=1)  # (F, 3)
         mn = np.asarray(min_xyz, dtype=np.float32)
         mx = np.asarray(max_xyz, dtype=np.float32)
-        mask = ((centroids >= mn) & (centroids <= mx)).all(axis=1)
+        
+        if strict:
+            verts = mesh.vertices[mesh.faces]
+            mask = ((verts >= mn) & (verts <= mx)).all(axis=(1, 2))
+        else:
+            centroids = mesh.vertices[mesh.faces].mean(axis=1)  # (F, 3)
+            mask = ((centroids >= mn) & (centroids <= mx)).all(axis=1)
+            
         face_ids = [int(i) for i in range(mesh.face_count) if mask[i]]
         return self.paint_faces(face_ids, colour)
 

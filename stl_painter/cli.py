@@ -237,7 +237,8 @@ def _run_pipeline_step(session: CLISession, step: dict[str, Any]) -> str:
         colour = _parse_color(str(step["color"]))
         mn = tuple(float(v) for v in step["min"])
         mx = tuple(float(v) for v in step["max"])
-        touched = session.paint_region(mn, mx, colour)  # type: ignore[arg-type]
+        strict = bool(step.get("strict", False))
+        touched = session.paint_region(mn, mx, colour, strict=strict)  # type: ignore[arg-type]
         return f"paint-region -> {len(touched):,} faces"
     if op == "save":
         session.save(str(step["path"]))

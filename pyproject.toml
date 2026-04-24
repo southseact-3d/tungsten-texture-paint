@@ -16,7 +16,11 @@ dependencies = [
   "numpy-stl",
   "dearpygui",
   "Pillow",
+  "networkx",
 ]
+
+[project.scripts]
+tgpaint = "stl_painter.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

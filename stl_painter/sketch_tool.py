@@ -359,49 +359,171 @@ class SketchTool:
         mesh_model: MeshModel,
         document: SketchDocument,
         base_colours: dict[int, Color] | None = None,
+        *,
+        front_facing_only: bool = True,
     ) -> dict[int, Color]:
+        """Bake sketch entities onto mesh face colours using orthographic projection.
+
+        Each face centroid is projected onto the sketch plane via dot-product
+        (orthographic, not ray-cast), so the bake works reliably on curved surfaces,
+        thick solids, and any face regardless of its distance from the plane.
+
+        Args:
+            mesh_model: The mesh to paint.
+            document: The sketch document containing entities.
+            base_colours: Optional existing face-colour dict to blend onto.
+            front_facing_only: When True (default), only faces whose normal has a
+                positive dot-product with the sketch plane normal are painted,
+                preventing the bake from "bleeding through" to back faces.
+        """
         if not document.entities:
             return {}
-        all_uv = []
-        for entity in document.entities:
-            all_uv.extend(entity_snap_points(entity))
-        if not all_uv:
-            return {}
-        uv_points = np.asarray(all_uv, dtype=np.float32)
-        min_uv = uv_points.min(axis=0) - 0.05
-        max_uv = uv_points.max(axis=0) + 0.05
-        bounds = (
-            float(min_uv[0]),
-            float(min_uv[1]),
-            float(max_uv[0]),
-            float(max_uv[1]),
-        )
-        size_uv = np.maximum(max_uv - min_uv, 1e-3)
-        pixels_per_unit = max(256.0 / float(max(size_uv)), 128.0)
-        width = max(64, int(np.ceil(size_uv[0] * pixels_per_unit)))
-        height = max(64, int(np.ceil(size_uv[1] * pixels_per_unit)))
-        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        for entity in document.entities:
-            self.render_entity_to_image(entity, document, image, bounds, pixels_per_unit)
+
+        colours = base_colours or {
+            face_id: mesh_model.face_colour(face_id)
+            for face_id in range(mesh_model.face_count)
+        }
+
+        # -- Orthographic projection of all face centroids onto the sketch plane --
+        # centroids shape: (F, 3)
+        centroids = mesh_model.vertices[mesh_model.faces].mean(axis=1).astype(np.float32)
+        offsets = centroids - document.plane.origin          # (F, 3)
+        u_proj = (offsets * document.plane.tangent_u).sum(axis=1)   # (F,)
+        v_proj = (offsets * document.plane.tangent_v).sum(axis=1)   # (F,)
+
+        # -- Optional: skip back-facing faces --
+        if front_facing_only:
+            dots = (mesh_model.normals * document.plane.normal).sum(axis=1)  # (F,)
+            front_mask = dots >= -0.1  # allow nearly-perpendicular faces too
+        else:
+            front_mask = np.ones(mesh_model.face_count, dtype=bool)
 
         baked: dict[int, Color] = {}
-        colours = base_colours or {
-            face_id: mesh_model.face_colour(face_id) for face_id in range(mesh_model.face_count)
-        }
-        for face_id, face in enumerate(mesh_model.faces):
-            verts = mesh_model.vertices[face]
-            distances = np.dot(verts - document.plane.origin, document.plane.normal)
-            if np.max(np.abs(distances)) > 0.02:
-                continue
-            uv = np.asarray(
-                [self.world_to_plane(document.plane, point) for point in verts],
-                dtype=np.float32,
-            )
-            overlay = _sample_polygon(image, uv, bounds, pixels_per_unit)
-            if overlay is None:
-                continue
-            baked[face_id] = blend_over(colours[face_id], overlay)
+
+        for entity in document.entities:
+            raw_colour = entity.data.get("colour", [255, 0, 0, 255])
+            colour = clamp_color(tuple(int(c) for c in raw_colour))
+
+            if entity.kind in ("text", "svg"):
+                # Raster path for text/SVG: render to an image then sample
+                face_ids = _raster_bake_entity(self, entity, document, mesh_model,
+                                               u_proj, v_proj, front_mask, colours)
+            else:
+                face_ids = _faces_covered_by_entity(entity, u_proj, v_proj)
+                face_ids = [fid for fid in face_ids if front_mask[fid]]
+
+            for face_id in face_ids:
+                baked[int(face_id)] = colour
+
         return baked
+
+
+# ---------------------------------------------------------------------------
+# Module-level baking helpers (used by SketchTool.bake_document_to_faces)
+# ---------------------------------------------------------------------------
+
+def _faces_covered_by_entity(
+    entity: SketchEntity,
+    u_proj: np.ndarray,
+    v_proj: np.ndarray,
+) -> list[int]:
+    """Return face indices (into u_proj / v_proj) whose projected centroid falls
+    inside the geometric bounds of *entity*.
+
+    This uses pure NumPy broadcasting and works for **any** face regardless of
+    its 3-D distance from the sketch plane.
+    """
+    kind = entity.kind
+
+    if kind == "rect":
+        min_u, min_v = float(entity.data["min"][0]), float(entity.data["min"][1])
+        max_u, max_v = float(entity.data["max"][0]), float(entity.data["max"][1])
+        if min_u > max_u:
+            min_u, max_u = max_u, min_u
+        if min_v > max_v:
+            min_v, max_v = max_v, min_v
+        mask = (
+            (u_proj >= min_u) & (u_proj <= max_u)
+            & (v_proj >= min_v) & (v_proj <= max_v)
+        )
+        return [int(i) for i in np.where(mask)[0]]
+
+    if kind == "circle":
+        cx = float(entity.data["center"][0])
+        cy = float(entity.data["center"][1])
+        radius = float(entity.data["radius"])
+        du = u_proj - cx
+        dv = v_proj - cy
+        mask = (du * du + dv * dv) <= (radius * radius)
+        return [int(i) for i in np.where(mask)[0]]
+
+    if kind == "line":
+        start = np.asarray(entity.data["start"], dtype=np.float32)
+        end = np.asarray(entity.data["end"], dtype=np.float32)
+        half_w = max(float(entity.data.get("stroke_width", 0.02)) * 0.5, 1e-6)
+        line_vec = end - start
+        length = float(np.linalg.norm(line_vec))
+        if length < 1e-8:
+            return []
+        line_n = line_vec / length
+        pts = np.column_stack([u_proj, v_proj]).astype(np.float32)
+        rel = pts - start
+        t = np.clip(rel @ line_n, 0.0, length)
+        proj = start + np.outer(t, line_n)
+        dist = np.linalg.norm(pts - proj, axis=1)
+        return [int(i) for i in np.where(dist <= half_w)[0]]
+
+    return []
+
+
+def _raster_bake_entity(
+    tool: "SketchTool",
+    entity: "SketchEntity",
+    document: "SketchDocument",
+    mesh_model: "MeshModel",
+    u_proj: np.ndarray,
+    v_proj: np.ndarray,
+    front_mask: np.ndarray,
+    colours: dict[int, "Color"],
+) -> list[int]:
+    """Rasterise a single text/SVG entity to a small image and return the face IDs
+    whose projected centroid lands inside a painted pixel.
+
+    Falls back gracefully: if rasterisation produces no pixels, returns an empty list.
+    """
+    snap_pts = entity_snap_points(entity)
+    if not snap_pts:
+        return []
+
+    # Build tight UV bounding box for the entity
+    uv_arr = np.asarray(snap_pts, dtype=np.float32)
+    min_uv = uv_arr.min(axis=0) - 0.05
+    max_uv = uv_arr.max(axis=0) + 0.05
+    bounds = (float(min_uv[0]), float(min_uv[1]), float(max_uv[0]), float(max_uv[1]))
+    size_uv = np.maximum(max_uv - min_uv, 1e-3)
+    pixels_per_unit = max(256.0 / float(max(size_uv)), 128.0)
+    width  = max(64, int(np.ceil(size_uv[0] * pixels_per_unit)))
+    height = max(64, int(np.ceil(size_uv[1] * pixels_per_unit)))
+
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    tool.render_entity_to_image(entity, document, image, bounds, pixels_per_unit)
+
+    # Find faces whose UV projection lands inside the image and hits a painted pixel
+    result: list[int] = []
+    for face_id in range(mesh_model.face_count):
+        if not front_mask[face_id]:
+            continue
+        u = float(u_proj[face_id])
+        v = float(v_proj[face_id])
+        # Convert UV → pixel coordinate
+        px = int((u - bounds[0]) * pixels_per_unit)
+        py = int((bounds[3] - v) * pixels_per_unit)
+        if 0 <= px < width and 0 <= py < height:
+            pixel = image.getpixel((px, py))
+            if pixel[3] > 16:  # has a meaningful alpha → inside painted region
+                result.append(face_id)
+
+    return result
 
 
 def entity_snap_points(entity: SketchEntity) -> list[np.ndarray]:

@@ -31,6 +31,28 @@ def test_pick_face_location_cpu_falls_back_without_rtree(
     assert hit.distance > 0.0
 
 
+def test_pick_face_location_cpu_falls_back_on_any_backend_error(
+    square_mesh, monkeypatch
+) -> None:
+    """Any ray-backend failure (not just missing rtree) must fall back."""
+    camera = OrbitCamera.for_mesh(square_mesh.vertices)
+
+    def fake_mesh() -> SimpleNamespace:
+        ray = SimpleNamespace(
+            intersects_location=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("broken GL/backend")
+            )
+        )
+        return SimpleNamespace(ray=ray)
+
+    monkeypatch.setattr(type(square_mesh), "mesh", lambda self: fake_mesh())
+
+    hit = pick_face_location_cpu(square_mesh, camera, 50.0, 50.0, (100, 100))
+
+    assert hit is not None
+    assert hit.face_id in {0, 1}
+
+
 def test_pick_face_cpu_returns_face_id(square_mesh) -> None:
     camera = OrbitCamera.for_mesh(square_mesh.vertices)
     face_id = pick_face_cpu(square_mesh, camera, 50.0, 50.0, (100, 100))

@@ -88,17 +88,18 @@ def pick_face_location_cpu(
             ray_directions=np.asarray([direction], dtype=np.float32),
             multiple_hits=True,
         )
-    except ModuleNotFoundError as exc:
+    except Exception as exc:
+        # Never fail a pick silently: the accelerated ray backend depends on
+        # optional native packages (rtree/embree/scipy) that may be missing
+        # or broken in frozen builds, so always fall back to the dependency-
+        # free vectorized Moller-Trumbore test.
         if not _CPU_PICK_WARNING_EMITTED:
             logger.warning(
-                "CPU picking accelerator unavailable (%s); using fallback ray test",
+                "Accelerated picking unavailable (%s); using fallback ray test",
                 exc,
             )
             _CPU_PICK_WARNING_EMITTED = True
         return _pick_face_location_fallback(mesh_model, origin, direction)
-    except Exception:
-        logger.exception("CPU picking failed unexpectedly")
-        return None
     if len(face_ids) == 0:
         return None
     distances = np.linalg.norm(locations - origin[None, :], axis=1)

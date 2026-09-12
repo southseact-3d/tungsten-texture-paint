@@ -86,21 +86,39 @@ class PaintTool:
         self.undo_stack.push(changes)
         return [change.face_id for change in changes]
 
-    def flood_fill(self, start_face_id: int, colour: Color) -> list[int]:
-        updates = self.flood_fill_updates(start_face_id, colour)
+    def flood_fill(
+        self, start_face_id: int, colour: Color, tolerance: float = 0.0
+    ) -> list[int]:
+        updates = self.flood_fill_updates(start_face_id, colour, tolerance=tolerance)
         return self.paint_faces(updates)
 
-    def flood_fill_updates(self, start_face_id: int, colour: Color) -> dict[int, Color]:
-        target_colour = self.mesh_model.face_colour(start_face_id)
-        if target_colour == colour:
+    def flood_fill_updates(
+        self, start_face_id: int, colour: Color, tolerance: float = 0.0
+    ) -> dict[int, Color]:
+        """Flood-fill connected faces similar to the seed face's colour.
+
+        ``tolerance`` is a max RGB Euclidean distance (0 = exact match).
+        Non-zero tolerance lets fill cross the ±1-2 LSB variance left by
+        baked texture colours on pretextured imports.
+        """
+        target = np.asarray(
+            self.mesh_model.face_colour(start_face_id)[:3], dtype=np.float32
+        )
+        if np.linalg.norm(
+            target - np.asarray(colour[:3], dtype=np.float32)
+        ) <= max(0.0, float(tolerance)):
             return {}
         adjacency = self.mesh_model.adjacency_map()
         queue = deque([start_face_id])
         visited = {start_face_id}
         updates: dict[int, Color] = {}
+        limit = max(0.0, float(tolerance))
         while queue:
             face_id = queue.popleft()
-            if self.mesh_model.face_colour(face_id) != target_colour:
+            candidate = np.asarray(
+                self.mesh_model.face_colour(face_id)[:3], dtype=np.float32
+            )
+            if float(np.linalg.norm(candidate - target)) > limit:
                 continue
             if face_id not in self.mesh_model.masked_faces:
                 updates[face_id] = colour

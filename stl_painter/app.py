@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import time
 from math import ceil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -23,6 +24,7 @@ from .importer import load_model
 from .interaction_state import InteractionState
 from .logging_utils import log_file_path
 from .mesh_model import MeshModel
+from . import nav_cube
 from .paint_tool import PaintTool
 from .picking import PickResult, pick_face_location_cpu
 from .project_io import PROJECT_EXTENSION, load_project, load_tg3d, save_tg3d
@@ -120,6 +122,8 @@ class TexturePainterApp:
         self._last_brush_face: int | None = None
         self._timeline_context_index: int = 0
         self._pending_dialog: str | None = None
+        self._last_hover_px: tuple[int, int] | None = None
+        self._last_hover_time: float = 0.0
         self._load_ai_settings()
         self._load_svg_settings()
         self._load_recent_projects()
@@ -615,6 +619,15 @@ class TexturePainterApp:
                         self.state.brush, "angle_tolerance_degrees", float(value)
                     ),
                 )
+                dpg.add_slider_float(
+                    label="Fill Tolerance",
+                    min_value=0.0,
+                    max_value=100.0,
+                    default_value=self.state.fill_tolerance,
+                    callback=lambda _s, value: setattr(
+                        self.state, "fill_tolerance", float(value)
+                    ),
+                )
                 dpg.add_button(
                     label="Group Faces",
                     callback=self._on_group_faces,
@@ -873,6 +886,7 @@ class TexturePainterApp:
         if self.state.workspace_mode == mode:
             return
         self.state.workspace_mode = mode  # type: ignore[assignment]
+        self.state.hovered_face = None
         self._sync_workspace_ui()
         self._mark_viewport_dirty()
         self._set_status(
@@ -915,81 +929,20 @@ class TexturePainterApp:
         return {
             "size": (width, height),
             "center": (width / 2.0, height / 2.0),
-            "radius": 44.0,
-            "orbit_radius": 34.0,
-            "axis_length": 28.0,
-            "handle_radius": 10.0,
+            "radius": 60.0,
+            "orbit_radius": 52.0,
+            "half_size": 36.0,
         }
 
-    def _nav_axis_items(self) -> list[dict[str, object]]:
+    def _nav_cube_faces(self) -> list[dict[str, object]]:
         gizmo = self._nav_gizmo_geometry()
-        center_x, center_y = gizmo["center"]  # type: ignore[misc]
-        axis_length = float(gizmo["axis_length"])
-        rotation = self.camera.view_matrix()[:3, :3]
-        axes = [
-            (
-                "xp",
-                np.array([1.0, 0.0, 0.0], dtype=np.float32),
-                (227, 74, 89, 255),
-                "X",
-                True,
-            ),
-            (
-                "xn",
-                np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-                (227, 74, 89, 255),
-                "X",
-                False,
-            ),
-            (
-                "yp",
-                np.array([0.0, 1.0, 0.0], dtype=np.float32),
-                (130, 196, 55, 255),
-                "Y",
-                True,
-            ),
-            (
-                "yn",
-                np.array([0.0, -1.0, 0.0], dtype=np.float32),
-                (130, 196, 55, 255),
-                "Y",
-                False,
-            ),
-            (
-                "zp",
-                np.array([0.0, 0.0, 1.0], dtype=np.float32),
-                (64, 150, 255, 255),
-                "Z",
-                True,
-            ),
-            (
-                "zn",
-                np.array([0.0, 0.0, -1.0], dtype=np.float32),
-                (64, 150, 255, 255),
-                "Z",
-                False,
-            ),
-        ]
-        items: list[dict[str, object]] = []
-        for axis_name, direction, colour, label, positive in axes:
-            camera_space = rotation @ direction
-            point = (
-                center_x + float(camera_space[0]) * axis_length,
-                center_y - float(camera_space[1]) * axis_length,
-            )
-            items.append(
-                {
-                    "axis": axis_name,
-                    "label": label,
-                    "positive": positive,
-                    "point": point,
-                    "depth": float(camera_space[2]),
-                    "fill": colour if positive else (0, 0, 0, 0),
-                    "outline": colour,
-                    "line_colour": colour,
-                }
-            )
-        return items
+        center = gizmo["center"]
+        assert isinstance(center, tuple)
+        return nav_cube.project_cube(
+            self.camera.view_matrix()[:3, :3],
+            (float(center[0]), float(center[1])),
+            float(gizmo["half_size"]),
+        )
 
     def _draw_nav_pad(self) -> None:
         if not dpg.does_item_exist("viewport_nav_pad"):
@@ -998,7 +951,6 @@ class TexturePainterApp:
         gizmo = self._nav_gizmo_geometry()
         center = gizmo["center"]
         radius = gizmo["radius"]
-        orbit_radius = gizmo["orbit_radius"]
         dpg.draw_circle(
             center,
             radius,
@@ -1007,58 +959,30 @@ class TexturePainterApp:
             thickness=2,
             parent="viewport_nav_pad",
         )
-        dpg.draw_circle(
-            center,
-            orbit_radius,
-            color=(208, 212, 220, 180),
-            thickness=1,
-            parent="viewport_nav_pad",
-        )
-        dpg.draw_circle(
-            center,
-            4,
-            color=(84, 90, 100, 255),
-            fill=(84, 90, 100, 255),
-            parent="viewport_nav_pad",
-        )
-        axis_items = self._nav_axis_items()
-        for item in sorted(axis_items, key=lambda axis: axis["depth"], reverse=True):
-            start = center
-            end = item["point"]
-            line_colour = item["line_colour"]
-            if not item["positive"]:
-                line_colour = (*line_colour[:3], 90)
-            dpg.draw_line(
-                start, end, color=line_colour, thickness=2, parent="viewport_nav_pad"
+        faces = self._nav_cube_faces()
+        centers = nav_cube.face_centers_2d(faces)
+        for face in faces:
+            axis = str(face["axis"])
+            polygon = [
+                (float(point[0]), float(point[1]))
+                for point in np.asarray(face["polygon"], dtype=np.float32)
+            ]
+            hovered = self.state.nav_hover_axis == axis
+            fill = tuple(face["fill"])  # type: ignore[union-attr]
+            if hovered:
+                fill = tuple(min(255, component + 45) for component in fill[:3]) + (255,)
+            outline = (24, 24, 28, 255) if hovered else (90, 96, 106, 255)
+            dpg.draw_polygon(
+                polygon,
+                color=outline,
+                fill=fill,
+                thickness=2 if hovered else 1,
+                parent="viewport_nav_pad",
             )
-        for item in sorted(axis_items, key=lambda axis: axis["depth"], reverse=True):
-            point = item["point"]
-            hovered = self.state.nav_hover_axis == item["axis"]
-            if item["positive"]:
-                fill = item["fill"]
-                outline = (24, 24, 28, 255) if hovered else item["outline"]
-                radius_px = 16 if hovered else 14
-                dpg.draw_circle(
-                    point,
-                    radius_px,
-                    color=outline,
-                    fill=fill,
-                    thickness=2,
-                    parent="viewport_nav_pad",
-                )
-            else:
-                radius_px = 11 if hovered else 9
-                dpg.draw_circle(
-                    point,
-                    radius_px,
-                    color=item["outline"],
-                    fill=(0, 0, 0, 0),
-                    thickness=2,
-                    parent="viewport_nav_pad",
-                )
+            label_pos = centers[axis]
             dpg.draw_text(
-                (point[0] - 4, point[1] - 7),
-                item["label"],
+                (label_pos[0] - 4, label_pos[1] - 7),
+                str(face["label"]),
                 color=(255, 255, 255, 255),
                 size=12,
                 parent="viewport_nav_pad",
@@ -1137,30 +1061,17 @@ class TexturePainterApp:
 
     def _nav_hit_test(self, mouse_pos: tuple[float, float]) -> tuple[str, str | None]:
         gizmo = self._nav_gizmo_geometry()
-        handle_radius = float(gizmo["handle_radius"])
-        center_x, center_y = gizmo["center"]  # type: ignore[misc]
-        dx = mouse_pos[0] - center_x
-        dy = mouse_pos[1] - center_y
-        for item in self._nav_axis_items():
-            point_x, point_y = item["point"]  # type: ignore[misc]
-            if (mouse_pos[0] - point_x) ** 2 + (mouse_pos[1] - point_y) ** 2 <= (
-                handle_radius + 5.0
-            ) ** 2:
-                return "axis", str(item["axis"])
-        if dx * dx + dy * dy <= (float(gizmo["radius"]) + 8.0) ** 2:
-            return "orbit", None
-        return "none", None
+        center = gizmo["center"]
+        assert isinstance(center, tuple)
+        return nav_cube.hit_test(
+            (float(mouse_pos[0]), float(mouse_pos[1])),
+            self._nav_cube_faces(),
+            float(gizmo["orbit_radius"]),
+            (float(center[0]), float(center[1])),
+        )
 
     def _snap_camera_to_axis(self, axis: str) -> None:
-        targets = {
-            "xp": (0.0, 0.0),
-            "xn": (180.0, 0.0),
-            "yp": (0.0, 89.0),
-            "yn": (0.0, -89.0),
-            "zp": (90.0, 0.0),
-            "zn": (-90.0, 0.0),
-        }
-        azimuth, elevation = targets[axis]
+        azimuth, elevation = nav_cube.snap_angles(axis)
         self.camera.set_angles(azimuth, elevation)
         self._mark_viewport_dirty()
 
@@ -1804,6 +1715,67 @@ class TexturePainterApp:
             if point:
                 self._draw_point(rgba, point, (0.0, 0.0, 0.0))
 
+    def _update_hover_face(self, mouse_pos: tuple[float, float]) -> None:
+        """Refresh the idle-hover face highlight (paint workspace only)."""
+        if (
+            self.mesh_model is None
+            or self.state.workspace_mode != "paint"
+            or self.state.interaction_mode != "paint"
+            or self.state.dragging
+            or self.state.nav_dragging
+        ):
+            if self.state.hovered_face is not None:
+                self.state.hovered_face = None
+                self._mark_viewport_dirty()
+            return
+        if self._nav_pad_hovered():
+            if self.state.hovered_face is not None:
+                self.state.hovered_face = None
+                self._mark_viewport_dirty()
+            return
+        pixel = (int(mouse_pos[0]), int(mouse_pos[1]))
+        now = time.monotonic()
+        if pixel == self._last_hover_px and now - self._last_hover_time < 0.05:
+            return
+        self._last_hover_px = pixel
+        self._last_hover_time = now
+        face_id: int | None = None
+        try:
+            render_x, render_y, _ = self._to_render_coords(
+                (float(pixel[0]), float(pixel[1]))
+            )
+            if self.renderer is not None and self.renderer._gpu_ready:
+                face_id = self.renderer.pick_face(
+                    self.camera, int(render_x), int(render_y)
+                )
+            else:
+                pick = self._pick_result((float(pixel[0]), float(pixel[1])))
+                face_id = pick.face_id if pick is not None else None
+        except Exception:
+            logger.debug("Hover pick failed", exc_info=True)
+            face_id = None
+        if face_id != self.state.hovered_face:
+            self.state.hovered_face = face_id
+            self._mark_viewport_dirty()
+
+    def _overlay_hovered_face(self, rgba: np.ndarray) -> None:
+        if self.mesh_model is None or self.state.hovered_face is None:
+            return
+        face_id = int(self.state.hovered_face)
+        if not 0 <= face_id < self.mesh_model.face_count:
+            return
+        corners = [
+            self._project_world_to_screen(vertex)
+            for vertex in self.mesh_model.face_vertices(face_id)
+        ]
+        if any(point is None for point in corners):
+            return
+        p0, p1, p2 = corners
+        assert p0 is not None and p1 is not None and p2 is not None
+        self._draw_line(rgba, p0, p1, (0.2, 0.95, 0.95), alpha=0.95)
+        self._draw_line(rgba, p1, p2, (0.2, 0.95, 0.95), alpha=0.95)
+        self._draw_line(rgba, p2, p0, (0.2, 0.95, 0.95), alpha=0.95)
+
     def _overlay_selected_faces(self, rgba: np.ndarray) -> None:
         if self.mesh_model is None:
             return
@@ -1834,6 +1806,7 @@ class TexturePainterApp:
             self._overlay_sketch_entities(rgba)
             self._overlay_masked_faces(rgba)
             self._overlay_selected_faces(rgba)
+            self._overlay_hovered_face(rgba)
         self._texture_data[:, :, :] = rgba
         if self._viewport_texture_tag is not None:
             dpg.set_value(self._viewport_texture_tag, self._texture_data)
@@ -1856,15 +1829,71 @@ class TexturePainterApp:
         image_x, image_y = dpg.get_item_rect_min("viewport_image")
         return mouse_x - image_x, mouse_y - image_y
 
+    def _pick_viewport_size(self) -> tuple[int, int]:
+        """Render-space size matching mouse coordinates.
+
+        Mouse positions are measured against the displayed image rect, which
+        can drift from ``state.viewport_size`` after layout changes; picking
+        against a stale size shifts every ray off the model.
+        """
+        if dpg.does_item_exist("viewport_image"):
+            width, height = dpg.get_item_rect_size("viewport_image")
+            if width > 0 and height > 0:
+                return int(width), int(height)
+        return self.state.viewport_size
+
+    @staticmethod
+    def _map_display_to_render(
+        mouse_pos: tuple[float, float],
+        display_size: tuple[int, int],
+        render_size: tuple[int, int],
+    ) -> tuple[float, float, tuple[int, int]]:
+        """Map a display-space pointer position into render space.
+
+        The displayed image rect can drift from the render size after
+        layout changes; picking/projection against a stale size shifts
+        every ray off the model. Pure function so it is unit-testable
+        without a Dear PyGui context.
+        """
+        x, y = float(mouse_pos[0]), float(mouse_pos[1])
+        if (
+            display_size != render_size
+            and render_size[0] > 0
+            and render_size[1] > 0
+            and display_size[0] > 0
+            and display_size[1] > 0
+        ):
+            x = x * render_size[0] / display_size[0]
+            y = y * render_size[1] / display_size[1]
+        return x, y, render_size
+
+    def _to_render_coords(
+        self, mouse_pos: tuple[float, float]
+    ) -> tuple[float, float, tuple[int, int]]:
+        """Display-space mouse position mapped to renderer coordinates."""
+        display_size = self._pick_viewport_size()
+        render_size = self.state.viewport_size
+        mapped_x, mapped_y, size = self._map_display_to_render(
+            mouse_pos, display_size, render_size
+        )
+        if (display_size != render_size) and (
+            render_size[0] > 0 and render_size[1] > 0
+        ):
+            logger.debug(
+                "Pick size drift | display=%s render=%s", display_size, render_size
+            )
+        return mapped_x, mapped_y, size
+
     def _pick_result(self, mouse_pos: tuple[float, float]) -> PickResult | None:
         if self.mesh_model is None:
             return None
+        x, y, size = self._to_render_coords(mouse_pos)
         return pick_face_location_cpu(
             self.mesh_model,
             self.camera,
-            mouse_pos[0],
-            mouse_pos[1],
-            self.state.viewport_size,
+            x,
+            y,
+            size,
         )
 
     def _apply_updates(self, touched: list[int]) -> None:
@@ -1873,9 +1902,7 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
         self._refresh_timeline()
 
-    def _apply_paint_at_pick(
-        self, pick: PickResult, *, single_face: bool = False
-    ) -> None:
+    def _apply_paint_at_pick(self, pick: PickResult) -> None:
         if self.mesh_model is None or self.paint_tool is None:
             return
         tool = self.state.paint_tool
@@ -1898,20 +1925,15 @@ class TexturePainterApp:
             return
         if tool == "fill":
             updates = self.paint_tool.flood_fill_updates(
-                pick.face_id, self.state.active_colour
+                pick.face_id,
+                self.state.active_colour,
+                tolerance=self.state.fill_tolerance,
             )
-        elif single_face and tool in {"brush", "erase"}:
-            if pick.face_id in self.mesh_model.masked_faces:
-                updates = {}
-            else:
-                updates = {
-                    pick.face_id: (
-                        self.mesh_model.default_colour
-                        if tool == "erase"
-                        else self.state.active_colour
-                    )
-                }
         else:
+            # Clicks dab with the full brush radius (not a single face), so a
+            # click stays visible on dense meshes where one face is ~pixels.
+            # The centre face always takes full weight (see brush_updates).
+            # (Only brush/erase reach here; sample/mask/select return above.)
             radius = max(
                 0.0001,
                 self.state.brush.radius * max(1.0, self.mesh_model.mesh_diagonal()),
@@ -1942,6 +1964,19 @@ class TexturePainterApp:
         touched = self.commands.paint_faces(
             updates, description=f"{tool.title()} stroke"
         )
+        logger.info(
+            "Paint click | tool=%s face=%s candidates=%s touched=%s",
+            tool,
+            pick.face_id,
+            len(updates),
+            len(touched),
+        )
+        if not touched:
+            if pick.face_id in self.mesh_model.masked_faces:
+                self._set_status("Face is masked — unmask or Clear Mask to paint it")
+            else:
+                self._set_status("No change — face already has this colour")
+            return
         self._apply_updates(touched)
 
     def _start_sketch_plane(self, face_id: int) -> None:
@@ -2032,6 +2067,7 @@ class TexturePainterApp:
         self.state.dragging = True
         self.state.drag_button = button
         self.state.drag_origin_screen = mouse_pos
+        self.state.drag_engaged = False
         if button != 0:
             return
         if self.state.workspace_mode == "preview":
@@ -2044,7 +2080,7 @@ class TexturePainterApp:
             else:
                 pick = self._pick_result(mouse_pos)
                 if pick is not None:
-                    self._apply_paint_at_pick(pick, single_face=True)
+                    self._apply_paint_at_pick(pick)
                     self._last_brush_face = pick.face_id
             return
         if self._active_document() is None:
@@ -2164,12 +2200,17 @@ class TexturePainterApp:
             and self.state.interaction_mode == "paint"
             and self.state.paint_tool == "select"
         ):
-            self._finish_marquee_selection()
+            if self.state.drag_engaged:
+                self._finish_marquee_selection()
+            else:
+                self.state.marquee_start = None
+                self.state.marquee_end = None
         self.state.dragging = False
         self.state.drag_button = None
         self.state.drag_origin_screen = None
         self.state.drag_origin_plane = None
         self.state.active_handle = None
+        self.state.drag_engaged = False
 
     def _finish_marquee_selection(self) -> None:
         if (
@@ -2178,10 +2219,19 @@ class TexturePainterApp:
             or self.state.marquee_end is None
         ):
             return
-        min_x = min(self.state.marquee_start[0], self.state.marquee_end[0])
-        max_x = max(self.state.marquee_start[0], self.state.marquee_end[0])
-        min_y = min(self.state.marquee_start[1], self.state.marquee_end[1])
-        max_y = max(self.state.marquee_start[1], self.state.marquee_end[1])
+        # Marquee corners are display-space; projected face centers are
+        # render-space, so map the rect before comparing (same mapping as
+        # picking) or a scaled viewport selects nothing.
+        start_x, start_y, _ = self._to_render_coords(
+            (float(self.state.marquee_start[0]), float(self.state.marquee_start[1]))
+        )
+        end_x, end_y, _ = self._to_render_coords(
+            (float(self.state.marquee_end[0]), float(self.state.marquee_end[1]))
+        )
+        min_x = min(start_x, end_x)
+        max_x = max(start_x, end_x)
+        min_y = min(start_y, end_y)
+        max_y = max(start_y, end_y)
         selected: set[int] = set()
         for face_id in range(self.mesh_model.face_count):
             point = self._project_world_to_screen(self.mesh_model.face_center(face_id))
@@ -2210,10 +2260,10 @@ class TexturePainterApp:
             mouse_pos = self._global_mouse_position()
             dx = mouse_pos[0] - self.state.nav_drag_origin[0]
             dy = mouse_pos[1] - self.state.nav_drag_origin[1]
-            if dx * dx + dy * dy >= 1.0:
+            if dx * dx + dy * dy >= 9.0:
                 self.state.nav_drag_moved = True
             if self.state.nav_drag_moved:
-                self.camera.orbit(dx * 2.4, -dy * 2.4)
+                self.camera.orbit_pixels(dx, dy, 132.0, 132.0)
                 new_origin = self._center_nav_cursor()
                 self.state.nav_drag_origin = new_origin or self.state.nav_drag_origin
                 self._mark_viewport_dirty()
@@ -2223,25 +2273,40 @@ class TexturePainterApp:
             or not self.state.dragging
             or self.state.drag_origin_screen is None
         ):
+            if not self.state.dragging and not self.state.nav_dragging:
+                self._update_hover_face(self._viewport_mouse_position())
             return
         mouse_pos = self._viewport_mouse_position()
         dx = mouse_pos[0] - self.state.drag_origin_screen[0]
         dy = mouse_pos[1] - self.state.drag_origin_screen[1]
-        if self.state.drag_button == 1 or (
-            self.state.workspace_mode == "preview" and self.state.drag_button == 0
-        ):
-            self.camera.orbit(dx * 0.4, -dy * 0.4)
-            self.state.drag_origin_screen = mouse_pos
-            self._mark_viewport_dirty()
+        width, height = self._pick_viewport_size()
+        if self.state.drag_button == 1:
+            # VTK right-drag: dolly zoom in any mode.
+            if self._engage_drag(mouse_pos):
+                self.camera.dolly_pixels(dy, height)
+                self.state.drag_origin_screen = mouse_pos
+                self._mark_viewport_dirty()
             return
-        if self.state.drag_button == 2:
-            self.camera.pan(dx, dy)
-            self.state.drag_origin_screen = mouse_pos
-            self._mark_viewport_dirty()
+        if self.state.drag_button == 2 or (
+            self.state.drag_button == 0 and self.state.shift_down
+        ):
+            # VTK middle-drag (or Shift+Left): grab-style pan.
+            if self._engage_drag(mouse_pos):
+                self.camera.pan_pixels(dx, dy, height)
+                self.state.drag_origin_screen = mouse_pos
+                self._mark_viewport_dirty()
+            return
+        if self.state.drag_button != 0:
+            return
+        if self.state.workspace_mode == "preview":
+            # VTK left-drag: orbit (viewport-normalized).
+            if self._engage_drag(mouse_pos):
+                self.camera.orbit_pixels(dx, dy, width, height)
+                self.state.drag_origin_screen = mouse_pos
+                self._mark_viewport_dirty()
             return
         if (
             self.state.workspace_mode == "paint"
-            and self.state.drag_button == 0
             and self.state.interaction_mode == "paint"
             and self.state.paint_tool in {"brush", "erase"}
         ):
@@ -2251,17 +2316,38 @@ class TexturePainterApp:
                 self._last_brush_face = pick.face_id
         elif (
             self.state.workspace_mode == "paint"
-            and self.state.drag_button == 0
             and self.state.interaction_mode == "paint"
             and self.state.paint_tool == "select"
         ):
-            self.state.marquee_end = mouse_pos
-            self._mark_viewport_dirty()
+            if self._engage_drag(mouse_pos):
+                self.state.marquee_end = mouse_pos
+                self._mark_viewport_dirty()
+
+    def _engage_drag(self, mouse_pos: tuple[float, float]) -> bool:
+        """3px press-drag threshold (Slate/VTK parity).
+
+        Returns True once the pointer has moved far enough that the gesture
+        counts as a drag; resets the origin on crossing so the view does not
+        jump. Paint dabs happen on press, so strokes are unaffected.
+        """
+        if self.state.drag_engaged:
+            return True
+        origin = self.state.drag_origin_screen
+        if origin is None:
+            return False
+        dx = mouse_pos[0] - origin[0]
+        dy = mouse_pos[1] - origin[1]
+        if dx * dx + dy * dy < 9.0:
+            return False
+        self.state.drag_engaged = True
+        self.state.drag_origin_screen = mouse_pos
+        return True
 
     def _on_mouse_wheel(self, _sender: int, app_data: float) -> None:
         if not self._mouse_inside_viewport():
             return
-        self.camera.zoom(app_data * 0.25)
+        # VTK wheel zoom: 1.1^2 per notch, scroll up = closer.
+        self.camera.dolly_notches(float(app_data))
         self._mark_viewport_dirty()
 
     def _on_key_down(self, _sender: int, app_data: int) -> None:
@@ -2572,7 +2658,7 @@ class TexturePainterApp:
                 self._poll_keyboard_shortcuts()
                 self._sync_workspace_layout()
                 if spin and self.mesh_model is not None:
-                    self.camera.orbit(2.0, 1.0)
+                    self.camera.orbit_pixels(2.0, 1.0, 960.0, 720.0)
                     self._mark_viewport_dirty()
                 self._render_viewport()
                 dpg.render_dearpygui_frame()

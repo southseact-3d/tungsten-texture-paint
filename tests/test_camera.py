@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from stl_painter.camera import OrbitCamera, look_at, perspective
 
@@ -147,6 +148,77 @@ def test_orbit_camera_pan() -> None:
     camera.pan(100.0, 100.0)
 
     assert not np.allclose(camera.target, original_target)
+
+
+def _flat_camera() -> OrbitCamera:
+    return OrbitCamera(
+        target=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        distance=5.0,
+        azimuth=0.0,
+        elevation=0.0,
+    )
+
+
+def test_orbit_pixels_full_window_spans_200_degrees() -> None:
+    camera = _flat_camera()
+    camera.orbit_pixels(800.0, 0.0, 800.0, 600.0)
+
+    assert camera.azimuth == pytest.approx(-200.0)
+    assert camera.elevation == pytest.approx(0.0)
+
+
+def test_orbit_pixels_drag_down_raises_elevation() -> None:
+    camera = _flat_camera()
+    camera.orbit_pixels(0.0, 300.0, 800.0, 600.0)
+
+    # 200*300/600 = 100 degrees but clamped (VTK would roll over instead).
+    assert camera.elevation == pytest.approx(89.0)
+    assert camera.elevation > 0.0
+
+
+def test_orbit_pixels_normalized_by_size() -> None:
+    small = _flat_camera()
+    small.orbit_pixels(100.0, 0.0, 800.0, 600.0)
+    big = _flat_camera()
+    big.orbit_pixels(200.0, 0.0, 1600.0, 600.0)
+
+    assert small.azimuth == pytest.approx(big.azimuth)
+
+
+def test_dolly_pixels_down_zooms_out() -> None:
+    camera = _flat_camera()
+    camera.dolly_pixels(150.0, 600.0)  # drag down
+
+    assert camera.distance > 5.0
+
+
+def test_dolly_pixels_up_zooms_in() -> None:
+    camera = _flat_camera()
+    camera.dolly_pixels(-150.0, 600.0)
+
+    assert camera.distance < 5.0
+    assert camera.distance >= 0.05
+
+
+def test_dolly_notches_wheel_up_zooms_in() -> None:
+    camera = _flat_camera()
+    camera.dolly_notches(1.0)
+
+    assert camera.distance == pytest.approx(5.0 / 1.1**2)
+
+
+def test_pan_pixels_grab_style_and_scaled() -> None:
+    camera = _flat_camera()
+    before = camera.target.copy()
+    camera.pan_pixels(100.0, 0.0, 600.0)
+
+    moved = camera.target - before
+    # At az=0 the camera looks down -X, so screen-right is +Y: dragging
+    # right shifts the target toward -Y (content follows the cursor).
+    assert abs(moved[0]) < 1e-6
+    assert moved[1] < 0.0
+    expected = 2.0 * 5.0 * np.tan(np.radians(45.0) / 2.0) / 600.0 * 100.0
+    assert abs(moved[1]) == pytest.approx(expected, rel=1e-4)
 
 
 def test_orbit_camera_unproject_ray() -> None:

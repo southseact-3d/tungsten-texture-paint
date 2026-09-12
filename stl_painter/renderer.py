@@ -167,7 +167,6 @@ class MeshRenderer:
                 .reshape(-1, 3)
                 .astype("f4")
             )
-            face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
             normals = np.repeat(self.mesh_model.normals, 3, axis=0).astype("f4")
             colours = np.repeat(
                 np.array(
@@ -189,17 +188,7 @@ class MeshRenderer:
                 [positions, normals, colours], axis=1
             ).astype("f4")
             self._mesh_vbo = self.ctx.buffer(self._colour_vertices.tobytes())
-            edge_positions = np.stack(
-                [
-                    face_vertices[:, 0],
-                    face_vertices[:, 1],
-                    face_vertices[:, 1],
-                    face_vertices[:, 2],
-                    face_vertices[:, 2],
-                    face_vertices[:, 0],
-                ],
-                axis=1,
-            ).reshape(-1, 3)
+            edge_positions = self._full_triangle_edge_positions()
             self._edge_vbo = self.ctx.buffer(edge_positions.astype("f4").tobytes())
             self._position_vbo = self.ctx.buffer(positions.tobytes())
             self._face_id_vbo = self.ctx.buffer(face_ids.tobytes())
@@ -260,44 +249,41 @@ class MeshRenderer:
             color_attachments=[self._pick_tex], depth_attachment=pick_depth
         )
 
+    def _full_triangle_edge_positions(self) -> np.ndarray:
+        """All triangle edges as line-list positions (2 verts per edge).
+
+        Paint mode (`show_triangle_edges`) must outline every triangle so
+        the mesh visibly changes when entering texture-paint mode. This is
+        topology-only and never depends on face groups.
+        """
+        face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
+        return np.stack(
+            [
+                face_vertices[:, 0],
+                face_vertices[:, 1],
+                face_vertices[:, 1],
+                face_vertices[:, 2],
+                face_vertices[:, 2],
+                face_vertices[:, 0],
+            ],
+            axis=1,
+        ).reshape(-1, 3)
+
     def rebuild_edge_buffer(self) -> None:
         if not self._gpu_ready or self.ctx is None:
             logger.debug("rebuild_edge_buffer: GPU not ready or no context")
             return
-        internal_edges = self.mesh_model.get_internal_group_edges()
-        edge_positions = []
-
-        mesh = self.mesh_model.mesh()
-        if mesh and mesh.face_adjacency is not None:
-            vertex_pairs = [mesh.edges[i] for i in mesh.face_adjacency_edges]
-            face_pairs = mesh.face_adjacency
-
-            for (face1, face2), (v1, v2) in zip(face_pairs, vertex_pairs):
-                edge = (min(face1, face2), max(face1, face2))
-                if edge in internal_edges:
-                    continue
-                edge_positions.append(self.mesh_model.vertices[v1])
-                edge_positions.append(self.mesh_model.vertices[v2])
-
-        if edge_positions:
-            edge_positions_arr = np.array(edge_positions, dtype=np.float32)
-            self._edge_vbo = self.ctx.buffer(edge_positions_arr.tobytes())
-            self._edge_vao = self.ctx.vertex_array(
-                self._edge_program,
-                [(self._edge_vbo, "3f", "in_position")],
-            )
-            logger.debug(
-                "rebuild_edge_buffer: created %d external edges for %d groups",
-                len(edge_positions) // 2,
-                len(self.mesh_model.face_groups),
-            )
-        else:
-            self._edge_vbo = None
-            self._edge_vao = None
-            logger.debug(
-                "rebuild_edge_buffer: no external edges (all internal) for %d groups",
-                len(self.mesh_model.face_groups),
-            )
+        edge_positions_arr = self._full_triangle_edge_positions().astype("f4")
+        self._edge_vbo = self.ctx.buffer(edge_positions_arr.tobytes())
+        self._edge_vao = self.ctx.vertex_array(
+            self._edge_program,
+            [(self._edge_vbo, "3f", "in_position")],
+        )
+        logger.debug(
+            "rebuild_edge_buffer: created %d triangle edges for %d faces",
+            len(edge_positions_arr) // 2,
+            self.mesh_model.face_count,
+        )
 
     def _find_edge_neighbor(self, face_id: int, v0: int, v1: int) -> int | None:
         face_vertices = self.mesh_model.faces
@@ -546,7 +532,9 @@ class MeshRenderer:
         show_triangle_edges: bool = False,
     ) -> RenderSnapshot:
         render_size = self._render_size()
-        projected, order = self._sorted_face_indices(camera, render_size, min_area=1.25)
+        # No minimum-area culling: on dense meshes a painted face can be a
+        # few pixels, and culling it makes click-paint look like a no-op.
+        projected, order = self._sorted_face_indices(camera, render_size, min_area=0.0)
         width, height = render_size
         image = Image.new("RGBA", (width, height), tuple(int(v) for v in VIEWPORT_BG))
         draw = ImageDraw.Draw(image, "RGBA")

@@ -50,11 +50,13 @@ class InteractionState:
     sketch_tool: SketchMode = "select"
     active_colour: Color = (255, 80, 80, 255)
     paint_linked_faces: bool = False
+    fill_tolerance: float = 8.0
     hovered_face: int | None = None
     drag_origin_screen: tuple[float, float] | None = None
     drag_origin_plane: np.ndarray | None = None
     dragging: bool = False
     drag_button: int | None = None
+    drag_engaged: bool = False
     nav_dragging: bool = False
     nav_drag_origin: tuple[float, float] | None = None
     nav_hover_axis: NavAxis | None = None

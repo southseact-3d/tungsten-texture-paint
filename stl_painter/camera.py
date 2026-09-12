@@ -80,6 +80,59 @@ class OrbitCamera:
         self.azimuth += delta_x
         self.elevation = float(np.clip(self.elevation + delta_y, -89.0, 89.0))
 
+    def orbit_pixels(
+        self, dx_px: float, dy_down_px: float, width: float, height: float
+    ) -> None:
+        """VTK-trackball orbit: full-window drag spans ~200 degrees.
+
+        Mirrors ``vtkInteractorStyleTrackballCamera::Rotate`` (MotionFactor
+        10): ``rxf = -200*dx/width``, ``ryf = +200*dy_down/height`` (screen
+        y grows downwards, VTKmaths y grows upwards). Elevation stays
+        clamped to +/-89 degrees (VTK instead rolls over the poles; the
+        clamp avoids flip disorientation).
+        """
+        width = max(1.0, float(width))
+        height = max(1.0, float(height))
+        self.azimuth -= 200.0 * float(dx_px) / width
+        self.elevation = float(
+            np.clip(self.elevation + 200.0 * float(dy_down_px) / height, -89.0, 89.0)
+        )
+
+    def dolly(self, factor: float) -> None:
+        """VTK-trackball dolly: factor > 1 moves toward the target."""
+        factor = max(1e-6, float(factor))
+        self.distance = max(0.05, self.distance / factor)
+
+    def dolly_pixels(self, dy_down_px: float, height: float) -> None:
+        """VTK right-drag dolly: ``factor = 1.1^(-20*dy_down/height)``."""
+        height = max(1.0, float(height))
+        self.dolly(1.1 ** (-20.0 * float(dy_down_px) / height))
+
+    def dolly_notches(self, notches: float) -> None:
+        """VTK wheel zoom: ``factor = 1.1^(2*notches)`` (up = closer)."""
+        self.dolly(1.1 ** (2.0 * float(notches)))
+
+    def pan_pixels(
+        self, dx_px: float, dy_down_px: float, viewport_height: float
+    ) -> None:
+        """VTK-trackball grab-style pan scaled by focal depth.
+
+        One screen pixel shifts the target by the world size of a pixel at
+        the focal distance, so content follows the cursor.
+        """
+        from math import tan as _tan
+
+        height = max(1.0, float(viewport_height))
+        world_per_pixel = (
+            2.0 * self.distance * _tan(radians(self.fov_y_degrees) / 2.0) / height
+        )
+        eye = self.position()
+        forward = _normalize(self.target - eye)
+        right = _normalize(np.cross(forward, np.array([0.0, 0.0, 1.0], dtype=np.float32)))
+        up = _normalize(np.cross(right, forward))
+        offset = (-right * float(dx_px) + up * float(dy_down_px)) * world_per_pixel
+        self.target += offset
+
     def set_angles(self, azimuth: float, elevation: float) -> None:
         self.azimuth = float(azimuth)
         self.elevation = float(np.clip(elevation, -89.0, 89.0))

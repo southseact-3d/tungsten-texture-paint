@@ -399,6 +399,12 @@ class MeshRenderer:
         return RenderSnapshot(rgba=rgba, viewport_size=self.viewport_size)
 
     def _render_pick_gpu(self, camera: OrbitCamera) -> None:
+        """Render the face-ID pick buffer (headless/self-test only).
+
+        Must NOT be called from the Dear PyGui frame thread: binding this
+        framebuffer there access-violates on some drivers (observed on AMD
+        Radeon) and kills the app. GUI picking always uses the CPU ray path.
+        """
         assert self._gpu_ready
         assert isinstance(self.ctx, moderngl.Context)
         assert self._pick_fbo is not None
@@ -422,6 +428,13 @@ class MeshRenderer:
         return self._build_pick_image_software(camera)
 
     def pick_face(self, camera: OrbitCamera, mouse_x: int, mouse_y: int) -> int | None:
+        """Pick a face at a viewport pixel.
+
+        The GPU branch is for headless use (e.g. ``self_test``) with a
+        standalone context only. GUI code must use CPU picking
+        (:func:`stl_painter.picking.pick_face_location_cpu`); calling the
+        GPU branch from the Dear PyGui frame thread can access-violate.
+        """
         if mouse_x < 0 or mouse_y < 0:
             return None
         width, height = self.viewport_size

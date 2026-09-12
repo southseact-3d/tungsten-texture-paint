@@ -75,3 +75,49 @@ def test_display_to_render_mapping_scales_and_passes_through() -> None:
         (12.0, 34.0), (0, 0), (400, 300)
     )
     assert (x, y, size) == (12.0, 34.0, (400, 300))
+
+
+def test_hover_cpu_pick_sweep_over_real_mesh() -> None:
+    """The hover path must resolve every viewport sample without error.
+
+    ``_update_hover_face`` is CPU-picking-only (the GPU pick-FBO render
+    access-violates from the GUI thread on some drivers), so sweep a grid
+    over a real 36k-face mesh exactly as hover does and require each
+    sample to return a valid face or a clean miss.
+    """
+    from pathlib import Path
+
+    from stl_painter.importer import import_stl
+
+    mesh = import_stl(Path(__file__).resolve().parent.parent / "dart.stl")
+    size = (960, 720)
+    camera = OrbitCamera.for_mesh(mesh.vertices)
+    hits = 0
+    samples = 0
+    for gx in range(80, 881, 100):
+        for gy in range(60, 661, 100):
+            result = pick_face_location_cpu(
+                mesh, camera, float(gx), float(gy), size
+            )
+            samples += 1
+            if result is not None:
+                hits += 1
+                assert 0 <= result.face_id < mesh.face_count
+                assert result.location.shape == (3,)
+                assert result.distance > 0.0
+    assert samples == 63
+    assert hits > 0
+
+
+def test_gui_never_calls_gpu_pick_face() -> None:
+    """Tripwire: GUI code must not call the GPU pick-FBO path.
+
+    See ``MeshRenderer.pick_face`` / ``_render_pick_gpu`` docstrings.
+    """
+    from pathlib import Path
+
+    app_source = (
+        Path(__file__).resolve().parent.parent / "stl_painter" / "app.py"
+    ).read_text(encoding="utf-8")
+    assert ".pick_face(" not in app_source
+    assert "_render_pick_gpu" not in app_source

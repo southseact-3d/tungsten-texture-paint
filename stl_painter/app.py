@@ -1741,16 +1741,12 @@ class TexturePainterApp:
         self._last_hover_time = now
         face_id: int | None = None
         try:
-            render_x, render_y, _ = self._to_render_coords(
-                (float(pixel[0]), float(pixel[1]))
-            )
-            if self.renderer is not None and self.renderer._gpu_ready:
-                face_id = self.renderer.pick_face(
-                    self.camera, int(render_x), int(render_y)
-                )
-            else:
-                pick = self._pick_result((float(pixel[0]), float(pixel[1])))
-                face_id = pick.face_id if pick is not None else None
+            # CPU picking only: issuing the GPU pick-FBO render from the
+            # Dear PyGui frame thread access-violates on some drivers
+            # (observed on AMD Radeon) and kills the app with no traceback,
+            # so hover highlighting must never call renderer.pick_face here.
+            pick = self._pick_result((float(pixel[0]), float(pixel[1])))
+            face_id = pick.face_id if pick is not None else None
         except Exception:
             logger.debug("Hover pick failed", exc_info=True)
             face_id = None

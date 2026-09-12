@@ -108,7 +108,7 @@ def cmd_info(args: argparse.Namespace) -> None:
     print(f"Input:      {args.input}")
     print(f"Faces:      {mesh.face_count:,}")
     print(f"Vertices:   {mesh.vertex_count:,}")
-    print(f"Bounding box:")
+    print("Bounding box:")
     print(f"  Min:      ({bb_min[0]:.4f}, {bb_min[1]:.4f}, {bb_min[2]:.4f}) mm")
     print(f"  Max:      ({bb_max[0]:.4f}, {bb_max[1]:.4f}, {bb_max[2]:.4f}) mm")
     print(f"  Extents:  ({extents[0]:.4f}, {extents[1]:.4f}, {extents[2]:.4f}) mm")
@@ -322,14 +322,14 @@ def _add_io(
         "--input", "-i",
         required=True,
         metavar="PATH",
-        help="Input file: STL / OBJ / GLB / .tg3d",
+        help="Input file: STL / OBJ / GLB / GLTF / 3MF / PLY / FBX / BLEND / .tg3d",
     )
     if output:
         p.add_argument(
             "--output", "-o",
             required=output_required,
             metavar="PATH",
-            help="Output path: .3mf / .stl / .obj / .glb / .tg3d",
+            help="Output path: .3mf / .stl / .obj / .glb / .gltf / .ply / .tg3d",
         )
     if checkpoint:
         p.add_argument(

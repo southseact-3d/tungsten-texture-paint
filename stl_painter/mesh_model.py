@@ -183,22 +183,60 @@ class MeshModel:
             safe_lengths = np.where(lengths > 1e-8, lengths, 1.0)
             normals = normals / safe_lengths
         face_colours: dict[int, Color] = {}
-        face_rgba = getattr(getattr(deduped, "visual", None), "face_colors", None)
-        if face_rgba is not None and len(face_rgba) == len(deduped.faces):
-            raw = np.asarray(face_rgba, dtype=np.uint8)
-            if raw.ndim == 2 and raw.shape[1] >= 3:
-                if raw.shape[1] == 3:
-                    alpha = np.full((raw.shape[0], 1), 255, dtype=np.uint8)
-                    raw = np.hstack([raw, alpha])
-                for face_id, colour in enumerate(raw):
-                    rgba = (
-                        int(colour[0]),
-                        int(colour[1]),
-                        int(colour[2]),
-                        int(colour[3]),
-                    )
-                    if rgba != DEFAULT_COLOR:
-                        face_colours[face_id] = rgba
+        visual = getattr(deduped, "visual", None)
+        # Textured visuals (OBJ map_Kd, GLB baseColorTexture, FBX textures):
+        # bake the texture down to one flat RGBA per face (mean of the
+        # face's UV samples). Painted faces later overwrite these entries.
+        if visual is not None and getattr(visual, "kind", None) == "texture":
+            try:
+                baked = visual.to_color()
+                vertex_rgba = getattr(baked, "vertex_colors", None)
+                vertices = getattr(deduped, "vertices", None)
+                if (
+                    vertex_rgba is not None
+                    and vertices is not None
+                    and len(vertex_rgba) == len(vertices)
+                ):
+                    raw = np.asarray(vertex_rgba, dtype=np.uint8)
+                    if raw.ndim == 2 and raw.shape[1] >= 3:
+                        if raw.shape[1] == 3:
+                            alpha = np.full(
+                                (raw.shape[0], 1), 255, dtype=np.uint8
+                            )
+                            raw = np.hstack([raw, alpha])
+                        # Mean the face's vertex samples to one flat colour.
+                        mean = raw[np.asarray(deduped.faces)].mean(axis=1)
+                        for face_id, colour in enumerate(mean):
+                            face_colours[face_id] = (
+                                int(round(colour[0])),
+                                int(round(colour[1])),
+                                int(round(colour[2])),
+                                int(round(colour[3])),
+                            )
+            except Exception:
+                face_colours = {}
+        else:
+            face_rgba = getattr(visual, "face_colors", None)
+            defined = bool(getattr(visual, "defined", True))
+            if (
+                defined
+                and face_rgba is not None
+                and len(face_rgba) == len(deduped.faces)
+            ):
+                raw = np.asarray(face_rgba, dtype=np.uint8)
+                if raw.ndim == 2 and raw.shape[1] >= 3:
+                    if raw.shape[1] == 3:
+                        alpha = np.full((raw.shape[0], 1), 255, dtype=np.uint8)
+                        raw = np.hstack([raw, alpha])
+                    for face_id, colour in enumerate(raw):
+                        rgba = (
+                            int(colour[0]),
+                            int(colour[1]),
+                            int(colour[2]),
+                            int(colour[3]),
+                        )
+                        if rgba != DEFAULT_COLOR:
+                            face_colours[face_id] = rgba
         return cls(
             vertices=deduped.vertices.view(np.ndarray),
             faces=deduped.faces.view(np.ndarray),
@@ -483,9 +521,7 @@ class MeshModel:
         filtered_colors = {
             str(face_id): list(colour)
             for face_id, colour in self.face_colours.items()
-            if colour != self.default_colour
-            and colour not in exclude_colors
-            and not (colour[0] == colour[1] == colour[2] and colour[3] == 255)
+            if colour != self.default_colour and colour not in exclude_colors
         }
         return {
             "face_colours": filtered_colors,

@@ -128,6 +128,30 @@ def export_model(path: str | Path, mesh_model: MeshModel) -> list[str]:
     if ext == ".3mf":
         return export_3mf(output, mesh_model)
     mesh, issues = validate_for_export(mesh_model)
+    # Re-attach baked/painted per-face colours so textured imports round-trip
+    # (previously non-3MF exports dropped all colour). Repair steps above may
+    # reorder faces, so align by overlap like the 3MF path does.
+    if mesh_model.face_colours and ext in {".obj", ".ply", ".glb", ".gltf"}:
+        try:
+            import numpy as np
+            from trimesh.visual import ColorVisuals
+
+            from .color_utils import DEFAULT_COLOR
+
+            colours = [
+                mesh_model.face_colour(face_id)
+                for face_id in range(mesh_model.face_count)
+            ]
+            count = len(mesh.faces)
+            rgba = np.zeros((count, 4), dtype=np.uint8)
+            for face_id in range(count):
+                if face_id < len(colours):
+                    rgba[face_id] = np.asarray(colours[face_id], dtype=np.uint8)
+                else:
+                    rgba[face_id] = np.asarray(DEFAULT_COLOR, dtype=np.uint8)
+            mesh.visual = ColorVisuals(face_colors=rgba)
+        except Exception:
+            pass
     output.parent.mkdir(parents=True, exist_ok=True)
     file_type = "gltf" if ext == ".gltf" else ext[1:]
     mesh.export(output, file_type=file_type)

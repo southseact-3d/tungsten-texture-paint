@@ -2,7 +2,20 @@ from __future__ import annotations
 
 import sys
 
-from stl_painter.logging_utils import configure_logging
+from stl_painter.logging_utils import configure_logging, log_file_path
+
+# Dump Python tracebacks to a file on segfaults / fatal errors so native
+# crashes (e.g. inside opengl32.dll) still leave a diagnosable trail in both
+# source and frozen runs.
+try:
+    import faulthandler
+    from pathlib import Path
+
+    _fault_log = Path(str(log_file_path())).with_name("stl_texture_painter.fault.log")
+    _fault_file = open(_fault_log, "w", encoding="utf-8")  # noqa: PTH123
+    faulthandler.enable(file=_fault_file)
+except Exception:
+    pass
 
 configure_logging()
 

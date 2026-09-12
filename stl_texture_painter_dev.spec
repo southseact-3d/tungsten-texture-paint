@@ -8,6 +8,7 @@ project_root = Path.cwd()
 datas = [
     (str(project_root / "stl_painter" / "shaders"), "stl_painter/shaders"),
     (str(project_root / "stl_painter" / "assets"), "stl_painter/assets"),
+    (str(project_root / "stl_painter" / "blend_to_glb.py"), "stl_painter"),
 ]
 binaries = []
 hiddenimports = [
@@ -17,6 +18,8 @@ hiddenimports = [
     "trimesh",
     "glcontext",
     "requests",
+    "lxml",
+    "lxml.etree",
 ]
 
 # Collect dynamically imported modules and data required at runtime.
@@ -33,6 +36,8 @@ for package_name in (
     "urllib3",
     "certifi",
     "charset_normalizer",
+    "lxml",
+    "scipy",
 ):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package_name)
     datas += pkg_datas

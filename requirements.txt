@@ -5,3 +5,5 @@ trimesh
 numpy-stl
 dearpygui
 Pillow
+lxml
+scipy

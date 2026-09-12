@@ -55,7 +55,6 @@ def _snapshot_to_delta(
         k: tuple(v)
         for k, v in prev_raw_colors.items()
         if tuple(v) not in (exclude_colors or set())
-        and not (v[0] == v[1] == v[2] and v[3] == 255)
     }
     curr_colors = current_delta.get("face_colours", {})
     changed_colors = {

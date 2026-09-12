@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 from math import ceil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -36,6 +37,12 @@ from .ui_panels import compute_workspace_layout, sync_mode_sections
 
 logger = logging.getLogger(__name__)
 _USER32 = ctypes.windll.user32
+
+# File-dialog request kinds served by the main loop (see _process_pending_dialog).
+_DIALOG_OPEN = "open"
+_DIALOG_VARIANT = "variant"
+_DIALOG_EXPORT = "export"
+_DIALOG_SAVE = "save"
 
 
 class _POINT(ctypes.Structure):
@@ -112,6 +119,7 @@ class TexturePainterApp:
         )
         self._last_brush_face: int | None = None
         self._timeline_context_index: int = 0
+        self._pending_dialog: str | None = None
         self._load_ai_settings()
         self._load_svg_settings()
         self._load_recent_projects()
@@ -120,6 +128,11 @@ class TexturePainterApp:
     def _pick_path_native(
         self, *, save: bool, title: str, filetypes: list[tuple[str, str]]
     ) -> str | None:
+        # NOTE: must only run from the main-loop dialog pump
+        # (_process_pending_dialog), never from inside a Dear PyGui frame
+        # callback: the Tk modal pumps window messages, and doing that
+        # re-entrantly mid-frame corrupts the GL context (native crash in
+        # opengl32.dll shortly after opening a file).
         root = Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -132,6 +145,78 @@ class TexturePainterApp:
         finally:
             root.destroy()
         return str(value) if value else None
+
+    def _request_dialog(self, kind: str) -> None:
+        """Defer a native file dialog to the main-loop pump (see run())."""
+        self._pending_dialog = kind
+        self._mark_viewport_dirty()
+
+    def _process_pending_dialog(self) -> None:
+        kind, self._pending_dialog = self._pending_dialog, None
+        if kind is None:
+            return
+        if kind == _DIALOG_OPEN:
+            path = self._pick_path_native(
+                save=False,
+                title="Open model or project",
+                filetypes=[
+                    (
+                        "3D Files",
+                        "*.stl *.obj *.glb *.gltf *.3mf *.ply *.fbx *.blend "
+                        "*.tg3d *.json",
+                    ),
+                    ("All files", "*.*"),
+                ],
+            )
+            if path:
+                self._on_open_selected(path)
+        elif kind == _DIALOG_VARIANT:
+            if self.mesh_model is None:
+                self._set_status("Load a base model before importing a variant")
+                return
+            path = self._pick_path_native(
+                save=False,
+                title="Import variant model",
+                filetypes=[
+                    (
+                        "3D Files",
+                        "*.stl *.obj *.glb *.gltf *.3mf *.ply *.fbx *.blend",
+                    ),
+                    ("All files", "*.*"),
+                ],
+            )
+            if path:
+                self._on_import_variant_selected(path)
+        elif kind == _DIALOG_EXPORT:
+            if self.mesh_model is None:
+                self._set_status("No mesh loaded")
+                return
+            formats = " ".join(
+                f"*{ext}" for ext in sorted(SUPPORTED_EXPORT_EXTENSIONS)
+            )
+            path = self._pick_path_native(
+                save=True,
+                title="Export model",
+                filetypes=[("3D Files", formats), ("All files", "*.*")],
+            )
+            if path:
+                self._on_export_selected(path)
+        elif kind == _DIALOG_SAVE:
+            if self.mesh_model is None:
+                self._set_status("No mesh loaded")
+                return
+            path = self._pick_path_native(
+                save=True,
+                title="Save TG3D Project",
+                filetypes=[
+                    ("Tungsten Project", f"*{PROJECT_EXTENSION}"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if path:
+                if Path(path).suffix.lower() != PROJECT_EXTENSION:
+                    path = f"{path}{PROJECT_EXTENSION}"
+                self._on_save_project_selected(path)
 
     def _load_ai_settings(self) -> None:
         payload = load_local_config()
@@ -961,13 +1046,6 @@ class TexturePainterApp:
                     thickness=2,
                     parent="viewport_nav_pad",
                 )
-            dpg.draw_text(
-                (point[0] - 4, point[1] - 7),
-                item["label"],
-                color=(255, 255, 255, 255),
-                size=12,
-                parent="viewport_nav_pad",
-            )
             else:
                 radius_px = 11 if hovered else 9
                 dpg.draw_circle(
@@ -978,6 +1056,13 @@ class TexturePainterApp:
                     thickness=2,
                     parent="viewport_nav_pad",
                 )
+            dpg.draw_text(
+                (point[0] - 4, point[1] - 7),
+                item["label"],
+                color=(255, 255, 255, 255),
+                size=12,
+                parent="viewport_nav_pad",
+            )
         dpg.draw_text(
             (28, 112),
             "Drag to rotate",
@@ -2233,15 +2318,11 @@ class TexturePainterApp:
     def _on_import_variant_click(
         self, _sender: int | None = None, _app_data: object | None = None
     ) -> None:
+        self._request_dialog(_DIALOG_VARIANT)
+
+    def _on_import_variant_selected(self, path: str) -> None:
         if self.mesh_model is None:
             self._set_status("Load a base model before importing a variant")
-            return
-        path = self._pick_path_native(
-            save=False,
-            title="Import variant model",
-            filetypes=[("3D Files", "*.stl *.obj *.glb *.gltf"), ("All files", "*.*")],
-        )
-        if not path:
             return
         try:
             variant = load_model(path)
@@ -2269,44 +2350,17 @@ class TexturePainterApp:
     def _on_open_click(
         self, _sender: int | None = None, _app_data: object | None = None
     ) -> None:
-        path = self._pick_path_native(
-            save=False,
-            title="Open model or project",
-            filetypes=[
-                ("3D Files", "*.stl *.obj *.glb *.gltf *.tg3d *.json"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path:
-            self._on_open_selected(path)
+        self._request_dialog(_DIALOG_OPEN)
 
     def _on_export_click(
         self, _sender: int | None = None, _app_data: object | None = None
     ) -> None:
-        formats = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXPORT_EXTENSIONS))
-        path = self._pick_path_native(
-            save=True,
-            title="Export model",
-            filetypes=[("3D Files", formats), ("All files", "*.*")],
-        )
-        if path:
-            self._on_export_selected(path)
+        self._request_dialog(_DIALOG_EXPORT)
 
     def _on_save_project_click(
         self, _sender: int | None = None, _app_data: object | None = None
     ) -> None:
-        path = self._pick_path_native(
-            save=True,
-            title="Save TG3D Project",
-            filetypes=[
-                ("Tungsten Project", f"*{PROJECT_EXTENSION}"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path:
-            if Path(path).suffix.lower() != PROJECT_EXTENSION:
-                path = f"{path}{PROJECT_EXTENSION}"
-            self._on_save_project_selected(path)
+        self._request_dialog(_DIALOG_SAVE)
 
     def _on_image_selected(self, _sender: int, app_data: dict[str, object]) -> None:
         self.state.ai_settings.image_path = str(app_data["file_path_name"])
@@ -2462,13 +2516,70 @@ class TexturePainterApp:
             self._refresh_ai_panels()
             self._set_status(f"AI error: {exc}")
 
+    def _test_native_dialog(self) -> None:
+        """Exercise the Tk native file dialog path headlessly (test hook).
+
+        Opens the real dialog (loading shell extensions like a user click),
+        auto-dismisses it with ESC from a helper thread, then continues.
+        """
+        import threading
+        import time
+
+        def _dismiss() -> None:
+            time.sleep(4.0)
+            try:
+                _USER32.keybd_event(0x1B, 0, 0, 0)  # VK_ESCAPE down
+                _USER32.keybd_event(0x1B, 0, 2, 0)  # VK_ESCAPE up
+            except Exception:
+                pass
+
+        helper = threading.Thread(target=_dismiss, daemon=True)
+        helper.start()
+        self._pending_dialog = _DIALOG_OPEN
+        self._process_pending_dialog()
+        helper.join(timeout=10.0)
+        logger.info("Native dialog smoke test done")
+
     def run(self) -> None:
         try:
+            # Headless smoke-test hooks (also useful for CI):
+            #   STL_TEXTURE_PAINTER_AUTOLOAD=<path>  open a model at startup
+            #   STL_TEXTURE_PAINTER_SPIN=1            orbit a little every frame
+            #   STL_TEXTURE_PAINTER_MAX_FRAMES=<n>    quit after n frames
+            if (
+                os.environ.get("STL_TEXTURE_PAINTER_TEST_DIALOG", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                self._test_native_dialog()
+            autoload = os.environ.get("STL_TEXTURE_PAINTER_AUTOLOAD", "").strip()
+            if autoload:
+                self._on_open_selected(autoload)
+            spin = (
+                os.environ.get("STL_TEXTURE_PAINTER_SPIN", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            try:
+                max_frames = int(
+                    os.environ.get("STL_TEXTURE_PAINTER_MAX_FRAMES", "0") or 0
+                )
+            except ValueError:
+                max_frames = 0
+            frames = 0
             while dpg.is_dearpygui_running():
+                # Serve deferred native dialogs here, outside Dear PyGui
+                # frame rendering (see _pick_path_native).
+                self._process_pending_dialog()
                 self._poll_keyboard_shortcuts()
                 self._sync_workspace_layout()
+                if spin and self.mesh_model is not None:
+                    self.camera.orbit(2.0, 1.0)
+                    self._mark_viewport_dirty()
                 self._render_viewport()
                 dpg.render_dearpygui_frame()
+                frames += 1
+                if max_frames and frames >= max_frames:
+                    logger.info("Smoke-test frame budget reached | frames=%s", frames)
+                    dpg.stop_dearpygui()
         finally:
             self._release_cursor_clip()
             dpg.destroy_context()

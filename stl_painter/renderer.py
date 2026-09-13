@@ -77,6 +77,8 @@ class MeshRenderer:
         self._face_id_vbo: moderngl.Buffer | None = None
         self._mesh_vao: moderngl.VertexArray | None = None
         self._edge_vao: moderngl.VertexArray | None = None
+        self._front_edge_vao: moderngl.VertexArray | None = None
+        self._front_edge_key: bytes | None = None
         self._pick_vao: moderngl.VertexArray | None = None
         self._colour_fbo: moderngl.Framebuffer | None = None
         self._pick_fbo: moderngl.Framebuffer | None = None
@@ -252,9 +254,10 @@ class MeshRenderer:
     def _full_triangle_edge_positions(self) -> np.ndarray:
         """All triangle edges as line-list positions (2 verts per edge).
 
-        Paint mode (`show_triangle_edges`) must outline every triangle so
-        the mesh visibly changes when entering texture-paint mode. This is
-        topology-only and never depends on face groups.
+        Source data for paint-mode outlines. The GPU path filters these to
+        front-facing faces per camera (see ``_front_edge_vao_for_camera``)
+        so only visible triangles are outlined — never an X-ray wireframe.
+        This is topology-only and never depends on face groups.
         """
         face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype("f4")
         return np.stack(
@@ -288,10 +291,68 @@ class MeshRenderer:
             return self._cad_boundary_edge_positions()
         return self._full_triangle_edge_positions()
 
+    def _front_facing_mask(self, camera: OrbitCamera) -> np.ndarray:
+        """Front-facing face mask for the current camera position.
+
+        Vectorized ``dot(normal, to_camera) > 0`` test. Used to restrict
+        paint-mode triangle outlines to visible faces so back-facing edges
+        never shine through the model (X-ray wireframe). This is the same
+        facing test the software renderer uses in ``_project_faces``.
+        """
+        to_camera = camera.position().astype(np.float32) - self._face_centers
+        return (
+            np.einsum(
+                "ij,ij->i", self.mesh_model.normals.astype(np.float32), to_camera
+            )
+            > 0.0
+        )
+
+    def _front_edge_vao_for_camera(
+        self, camera: OrbitCamera
+    ) -> moderngl.VertexArray | None:
+        """Cached VAO of front-facing triangle edges only.
+
+        Rebuilt only when the camera position changes, so per-frame cost in
+        paint mode is a single vectorized facing test plus a cache hit.
+        Returns None when no faces front the camera.
+        """
+        assert isinstance(self.ctx, moderngl.Context)
+        assert self._edge_program is not None
+        key = camera.position().astype("f4").tobytes()
+        if self._front_edge_key != key or self._front_edge_vao is None:
+            mask = self._front_facing_mask(camera)
+            if not bool(mask.any()):
+                self._front_edge_key = key
+                self._front_edge_vao = None
+                return None
+            face_vertices = self.mesh_model.vertices[self.mesh_model.faces].astype(
+                "f4"
+            )[mask]
+            edge_positions = np.stack(
+                [
+                    face_vertices[:, 0],
+                    face_vertices[:, 1],
+                    face_vertices[:, 1],
+                    face_vertices[:, 2],
+                    face_vertices[:, 2],
+                    face_vertices[:, 0],
+                ],
+                axis=1,
+            ).reshape(-1, 3)
+            vbo = self.ctx.buffer(edge_positions.astype("f4").tobytes())
+            self._front_edge_vao = self.ctx.vertex_array(
+                self._edge_program,
+                [(vbo, "3f", "in_position")],
+            )
+            self._front_edge_key = key
+        return self._front_edge_vao
+
     def rebuild_edge_buffer(self) -> None:
         if not self._gpu_ready or self.ctx is None:
             logger.debug("rebuild_edge_buffer: GPU not ready or no context")
             return
+        self._front_edge_key = None
+        self._front_edge_vao = None
         edge_positions_arr = self._edge_positions().astype("f4")
         self._edge_vbo = self.ctx.buffer(edge_positions_arr.tobytes())
         self._edge_vao = self.ctx.vertex_array(
@@ -403,13 +464,26 @@ class MeshRenderer:
         self._mesh_program["mvp"].write(self._mvp_bytes(camera))
         self._mesh_program["light_dir"].value = tuple(float(v) for v in light_dir)
         self._mesh_vao.render(mode=moderngl.TRIANGLES)
-        if show_triangle_edges and self._edge_vao is not None:
+        if show_triangle_edges:
             assert self._edge_program is not None
-            self.ctx.disable(moderngl.CULL_FACE)
             self._edge_program["mvp"].write(self._mvp_bytes(camera))
-            self._edge_program["depth_bias"].value = 0.0006
             self._edge_program["line_colour"].value = (0.0, 0.0, 0.0, 1.0)
-            self._edge_vao.render(mode=moderngl.LINES)
+            if self.mesh_model.has_cad_faces:
+                # STEP models: sparse CAD-boundary outlines only.
+                if self._edge_vao is not None:
+                    self.ctx.disable(moderngl.CULL_FACE)
+                    self._edge_program["depth_bias"].value = 0.0006
+                    self._edge_vao.render(mode=moderngl.LINES)
+            else:
+                # Triangle meshes: outline front-facing triangles only so
+                # back edges never shine through (X-ray wireframe). Depth
+                # testing stays on; the small bias lifts front edges just
+                # off the surface to avoid z-fighting.
+                front_vao = self._front_edge_vao_for_camera(camera)
+                if front_vao is not None:
+                    self.ctx.disable(moderngl.CULL_FACE)
+                    self._edge_program["depth_bias"].value = 0.0006
+                    front_vao.render(mode=moderngl.LINES)
         rgba = np.frombuffer(
             self._colour_fbo.read(components=4, alignment=1), dtype=np.uint8
         ).reshape((self.viewport_size[1], self.viewport_size[0], 4))

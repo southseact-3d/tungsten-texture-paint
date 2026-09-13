@@ -193,15 +193,17 @@ class PaintTool:
                 continue
             center = self.mesh_model.face_center(face_id)
             distance = float(np.linalg.norm(center - hit_point))
-            if distance > radius:
+            is_center = face_id == int(center_face_id)
+            if distance > radius and not is_center:
                 continue
             normal = _normalize(self.mesh_model.normals[face_id])
             dot = float(np.clip(np.dot(normal, target_normal), -1.0, 1.0))
             angle = acos(dot)
-            if angle > max_angle:
-                continue
-            if front_faces_only and dot < 0.25:
-                continue
+            if not is_center:
+                if angle > max_angle:
+                    continue
+                if front_faces_only and dot < 0.25:
+                    continue
             weight = _falloff_weight(distance, radius, falloff) * opacity
             if face_id == int(center_face_id):
                 weight = max(weight, 1.0)

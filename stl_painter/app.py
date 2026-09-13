@@ -127,6 +127,8 @@ class TexturePainterApp:
             dtype=np.float32,
         )
         self._last_brush_face: int | None = None
+        self._vis_pick_key: object = None
+        self._vis_pick_image: np.ndarray | None = None
         self._timeline_context_index: int = 0
         self._pending_dialog: str | None = None
         self._last_hover_px: tuple[int, int] | None = None
@@ -1403,6 +1405,8 @@ class TexturePainterApp:
 
     def _load_mesh_model(self, mesh_model: MeshModel) -> None:
         self.mesh_model = mesh_model
+        self._vis_pick_key = None
+        self._vis_pick_image = None
         if not mesh_model.face_groups:
             mesh_model.compute_face_groups()
         group_count = len(mesh_model.face_groups)
@@ -1657,12 +1661,143 @@ class TexturePainterApp:
             self._refresh_mask_count()
             self._set_status(f"Undid action at step {index}")
 
+    def should_show_triangle_edges(self) -> bool:
+        """Paint-mode outline switch.
+
+        Paint mode outlines triangles so the mesh visibly changes when
+        entering texture-paint mode. The outlines are occlusion-correct:
+        the GPU path draws front-facing edges only (see
+        ``MeshRenderer._front_edge_vao_for_camera``) and the software path
+        paints back-to-front, so back edges never shine through the model
+        like transparency. Kept as a helper so it is unit-testable.
+        """
+        try:
+            return bool(self.state.workspace_mode == "paint")
+        except Exception:
+            return False
+
+    def _is_face_front_visible(self, face_id: int) -> bool:
+        """Cheap front-facing check (backface cull, not true occlusion)."""
+        if self.mesh_model is None:
+            return False
+        if not 0 <= int(face_id) < self.mesh_model.face_count:
+            return False
+        normal = self.mesh_model.normals[int(face_id)].astype(np.float32)
+        to_camera = self.camera.position().astype(
+            np.float32
+        ) - self.mesh_model.face_center(int(face_id)).astype(np.float32)
+        return bool(float(np.dot(normal, to_camera)) > 0.0)
+
+    def _cached_pick_image(self) -> np.ndarray | None:
+        """Software face-ID image for occlusion tests, cached by camera key.
+
+        Pure-PIL render (no GL calls, so safe on the Dear PyGui thread).
+        Only available when the renderer is in software mode; in GPU mode
+        returns None and callers fall back to the facing test. Rebuilt at
+        most once per camera pose.
+        """
+        if self.mesh_model is None or self.renderer is None:
+            return None
+        try:
+            if bool(getattr(self.renderer, "_gpu_ready", False)):
+                return None
+            key = (
+                self.renderer._camera_key(self.camera),
+                int(self.mesh_model.face_count),
+            )
+            if (
+                getattr(self, "_vis_pick_key", None) != key
+                or getattr(self, "_vis_pick_image", None) is None
+            ):
+                self._vis_pick_image = (
+                    self.renderer._build_pick_image_software(self.camera)
+                )
+                self._vis_pick_key = key
+            image = self._vis_pick_image
+            width, height = tuple(self.state.viewport_size)
+            if image.shape[1] != int(width) or image.shape[0] != int(height):
+                return None
+            return image
+        except Exception:
+            logger.debug("pick-image visibility unavailable", exc_info=True)
+            return None
+
+    def _is_face_visible(
+        self,
+        face_id: int,
+        screen_point: tuple[int, int] | None = None,
+        pick_image: np.ndarray | None = None,
+    ) -> bool:
+        """True occlusion test for overlay dots and marquee selection.
+
+        With a software pick image, the face counts as visible when its
+        projected center pixel shows that same face (or the same CAD face,
+        so triangulation neighbours on one flat CAD plane pass). Without a
+        pick image (GPU mode / headless) falls back to the front-facing
+        check. When ``pick_image`` is omitted the cached image is fetched
+        automatically; pass an explicit image only to share one render
+        across many lookups.
+        """
+        if self.mesh_model is None:
+            return False
+        fid = int(face_id)
+        if not 0 <= fid < self.mesh_model.face_count:
+            return False
+        point = screen_point
+        if point is None:
+            point = self._project_world_to_screen(self.mesh_model.face_center(fid))
+        if point is None:
+            return False
+        if pick_image is None:
+            pick_image = self._cached_pick_image()
+        if pick_image is None:
+            return self._is_face_front_visible(fid)
+        try:
+            cx, cy = int(point[0]), int(point[1])
+            height, width = int(pick_image.shape[0]), int(pick_image.shape[1])
+            want_cad: object = None
+            if self.mesh_model.has_cad_faces:
+                try:
+                    want_cad = self.mesh_model.cad_id_for_face(fid)
+                except Exception:
+                    want_cad = None
+            # 3x3 window: dense-mesh faces can be a few pixels, so the exact
+            # center pixel may rasterize to a neighbour even when the face
+            # itself is visible.
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    x, y = cx + dx, cy + dy
+                    if not 0 <= x < width and 0 <= y < height:
+                        continue
+                    r, g, b = (int(v) for v in pick_image[y, x])
+                    shown = (r << 16) | (g << 8) | b
+                    if shown == fid:
+                        return True
+                    if shown >= self.mesh_model.face_count:
+                        continue
+                    if want_cad is not None:
+                        try:
+                            if self.mesh_model.cad_id_for_face(int(shown)) == want_cad:
+                                return True
+                        except Exception:
+                            pass
+            # Encoded black is ambiguous between background and face 0.
+            if fid == 0 and self._is_face_front_visible(fid):
+                x0 = max(0, min(cx, width - 1))
+                y0 = max(0, min(cy, height - 1))
+                if tuple(int(v) for v in pick_image[y0, x0]) == (0, 0, 0):
+                    return True
+            return False
+        except Exception:
+            logger.debug("face visibility lookup failed", exc_info=True)
+            return self._is_face_front_visible(fid)
+
     def _render_snapshot(self) -> RenderSnapshot:
         if self.mesh_model is None or self.renderer is None:
             return make_grid_snapshot(self.state.viewport_size)
         return self.renderer.render(
             self.camera,
-            show_triangle_edges=self.state.workspace_mode == "paint",
+            show_triangle_edges=self.should_show_triangle_edges(),
         )
 
     def _project_world_to_screen(self, point: np.ndarray) -> tuple[int, int] | None:
@@ -1830,9 +1965,11 @@ class TexturePainterApp:
     def _overlay_masked_faces(self, rgba: np.ndarray) -> None:
         if self.mesh_model is None:
             return
-        for face_id in list(self.mesh_model.masked_faces)[:250]:
+        faces = list(self.mesh_model.masked_faces)[:250]
+        pick_image = self._cached_pick_image() if faces else None
+        for face_id in faces:
             point = self._project_world_to_screen(self.mesh_model.face_center(face_id))
-            if point:
+            if point and self._is_face_visible(int(face_id), point, pick_image):
                 self._draw_point(rgba, point, (0.0, 0.0, 0.0))
 
     def _update_hover_face(self, mouse_pos: tuple[float, float]) -> None:
@@ -1913,9 +2050,11 @@ class TexturePainterApp:
     def _overlay_selected_faces(self, rgba: np.ndarray) -> None:
         if self.mesh_model is None:
             return
-        for face_id in list(self.state.selected_faces)[:500]:
+        faces = list(self.state.selected_faces)[:500]
+        pick_image = self._cached_pick_image() if faces else None
+        for face_id in faces:
             point = self._project_world_to_screen(self.mesh_model.face_center(face_id))
-            if point:
+            if point and self._is_face_visible(int(face_id), point, pick_image):
                 self._draw_point(rgba, point, (1.0, 1.0, 0.0))
         if self.state.marquee_start is not None and self.state.marquee_end is not None:
             x0, y0 = int(self.state.marquee_start[0]), int(self.state.marquee_start[1])
@@ -2391,12 +2530,20 @@ class TexturePainterApp:
         min_y = min(start_y, end_y)
         max_y = max(start_y, end_y)
         selected: set[int] = set()
+        # Single pick-image render gives true occlusion for every
+        # candidate (falls back to the facing test in GPU mode).
+        pick_image = self._cached_pick_image()
         for face_id in range(self.mesh_model.face_count):
             point = self._project_world_to_screen(self.mesh_model.face_center(face_id))
             if point is None:
                 continue
-            if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y:
-                selected.add(face_id)
+            if not min_x <= point[0] <= max_x and min_y <= point[1] <= max_y:
+                continue
+            # Only visible faces: without this the marquee selects
+            # backside faces through the model (transparent/X-ray effect).
+            if not self._is_face_visible(face_id, point, pick_image):
+                continue
+            selected.add(face_id)
         self.state.selected_faces = selected
         self.state.marquee_start = None
         self.state.marquee_end = None

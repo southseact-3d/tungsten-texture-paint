@@ -1,16 +1,16 @@
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
-$PyInstaller = Join-Path $Root ".venv\Scripts\pyinstaller.exe"
+$Python = Join-Path $Root ".venv\Scripts\python.exe"
 $WorkPath = Join-Path $Root ".pyinstaller-cache\work-release"
 $DistPath = Join-Path $Root "dist"
 $Spec = Join-Path $Root "stl_texture_painter.spec"
 
-if (-not (Test-Path $PyInstaller)) {
-    throw "PyInstaller not found at $PyInstaller"
+if (-not (Test-Path $Python)) {
+    throw "Virtual environment Python not found at $Python"
 }
 
-& $PyInstaller `
+& $Python -m PyInstaller `
     --noconfirm `
     --workpath $WorkPath `
     --distpath $DistPath `

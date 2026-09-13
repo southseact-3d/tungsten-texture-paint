@@ -180,7 +180,48 @@ def run_tool(context: AIToolContext, name: str, arguments_json: str) -> str:
         context.interaction_state.interaction_mode = arguments["mode"]
         return json.dumps({"ok": True, "mode": context.interaction_state.interaction_mode})
     if name == "set_active_color":
+        from .color_utils import rgba_hex, rgb_hex
+
         context.interaction_state.active_colour = clamp_color(arguments["rgba"])
+        try:
+            import dearpygui.dearpygui as dpg
+
+            active = list(context.interaction_state.active_colour)
+            for tag, value in (
+                ("active_colour_preview", active),
+                ("active_colour_picker", active),
+            ):
+                try:
+                    if dpg.does_item_exist(tag):
+                        dpg.set_value(tag, value)
+                except Exception:
+                    pass
+            try:
+                if dpg.does_item_exist("active_colour_hex_label"):
+                    dpg.set_value(
+                        "active_colour_hex_label",
+                        rgb_hex(context.interaction_state.active_colour),
+                    )
+            except Exception:
+                pass
+            try:
+                if dpg.does_item_exist("colour_popup_hex_label"):
+                    dpg.set_value(
+                        "colour_popup_hex_label",
+                        rgba_hex(context.interaction_state.active_colour),
+                    )
+            except Exception:
+                pass
+            try:
+                if dpg.does_item_exist("active_colour_hex_input"):
+                    dpg.set_value(
+                        "active_colour_hex_input",
+                        rgba_hex(context.interaction_state.active_colour),
+                    )
+            except Exception:
+                pass
+        except Exception:
+            pass
         return json.dumps({"ok": True, "rgba": list(context.interaction_state.active_colour)})
     if name == "create_sketch_plane":
         mesh = _require_mesh(context)

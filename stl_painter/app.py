@@ -16,7 +16,14 @@ from PIL import Image
 from .ai_agent import AIAgent, build_user_prompt
 from .ai_tools import AIToolContext
 from .camera import OrbitCamera
-from .color_utils import DEFAULT_COLOR, Color, clamp_color
+from .color_utils import (
+    DEFAULT_COLOR,
+    Color,
+    clamp_color,
+    parse_hex_color,
+    rgb_hex,
+    rgba_hex,
+)
 from .commands import AppCommands
 from .config import load_local_config, save_local_config
 from .exporter import SUPPORTED_EXPORT_EXTENSIONS, export_model
@@ -302,6 +309,7 @@ class TexturePainterApp:
                 format=dpg.mvFormat_Float_rgba,
             )
         self._create_file_dialogs()
+        self._build_colour_popup()
         with dpg.window(
             label="Tungsten Texture Paint",
             tag="home_window",
@@ -527,22 +535,22 @@ class TexturePainterApp:
             dpg.add_separator()
             dpg.add_text("Colour", color=(17, 24, 39))
             dpg.add_text("No mesh loaded", tag="mesh_info_text", wrap=260)
-            with dpg.group(horizontal=True):
-                for index, colour in enumerate(PALETTE):
-                    dpg.add_color_button(
-                        default_value=list(colour),
-                        width=40,
-                        height=30,
-                        callback=lambda _s, _a, _u=None, user_data=index: (
-                            self._select_palette_colour(user_data)
-                        ),
-                    )
-            dpg.add_color_picker(
-                label="Active Color",
+            dpg.add_text(
+                rgb_hex(self.state.active_colour),
+                tag="active_colour_hex_label",
+                color=(72, 86, 110),
+            )
+            dpg.add_color_button(
                 default_value=list(self.state.active_colour),
-                callback=self._on_custom_colour,
-                tag="active_colour_picker",
-                alpha_bar=True,
+                width=-1,
+                height=36,
+                tag="active_colour_preview",
+                callback=lambda *_: self._open_colour_popup(),
+            )
+            dpg.add_text(
+                "Click the swatch to change colour.",
+                color=(107, 114, 128),
+                wrap=260,
             )
             dpg.add_separator()
             dpg.add_text("Model Transform", color=(17, 24, 39))
@@ -732,6 +740,107 @@ class TexturePainterApp:
                     user_data="entities",
                 )
                 dpg.add_text("Click a face first to start a sketch plane.", wrap=260)
+
+    def _build_colour_popup(self) -> None:
+        with dpg.window(
+            label="Colour Picker",
+            tag="colour_picker_popup",
+            show=False,
+            width=440,
+            height=560,
+            no_collapse=True,
+        ):
+            dpg.add_text("Active Colour", color=(17, 24, 39))
+            dpg.add_text(
+                rgba_hex(self.state.active_colour),
+                tag="colour_popup_hex_label",
+                color=(72, 86, 110),
+            )
+            dpg.add_text("Palette", color=(17, 24, 39))
+            with dpg.group(horizontal=True, tag="colour_popup_palette"):
+                for index, colour in enumerate(PALETTE):
+                    dpg.add_color_button(
+                        default_value=list(colour),
+                        width=40,
+                        height=30,
+                        tag=f"colour_popup_palette_{index}",
+                        callback=lambda _s, _a, _u=None, user_data=index: (
+                            self._select_palette_colour(user_data)
+                        ),
+                    )
+            dpg.add_color_picker(
+                label="Active Color",
+                default_value=list(self.state.active_colour),
+                callback=self._on_custom_colour,
+                tag="active_colour_picker",
+                alpha_bar=True,
+                display_hex=True,
+            )
+            dpg.add_input_text(
+                label="Hex",
+                hint="#RRGGBB or #RRGGBBAA",
+                default_value=rgba_hex(self.state.active_colour),
+                tag="active_colour_hex_input",
+                on_enter=True,
+                callback=self._on_hex_entered,
+            )
+            dpg.add_text(
+                "Tip: press Enter in the hex field to apply. Changes apply live.",
+                color=(107, 114, 128),
+                wrap=400,
+            )
+            dpg.add_button(
+                label="Done",
+                callback=lambda *_: self._close_colour_popup(),
+                width=-1,
+            )
+
+    def _open_colour_popup(self) -> None:
+        if not dpg.does_item_exist("colour_picker_popup"):
+            return
+        self._sync_active_colour_ui()
+        try:
+            viewport_width = int(dpg.get_viewport_client_width())
+            viewport_height = int(dpg.get_viewport_client_height())
+            popup_width = 440
+            popup_height = 560
+            dpg.set_item_pos(
+                "colour_picker_popup",
+                [max(0, (viewport_width - popup_width) // 2), max(0, (viewport_height - popup_height) // 2)],
+            )
+        except Exception:
+            pass
+        dpg.show_item("colour_picker_popup")
+        try:
+            dpg.focus_item("colour_picker_popup")
+        except Exception:
+            pass
+
+    def _close_colour_popup(self) -> None:
+        if dpg.does_item_exist("colour_picker_popup"):
+            dpg.hide_item("colour_picker_popup")
+
+    def _sync_active_colour_ui(self) -> None:
+        active = self.state.active_colour
+        if dpg.does_item_exist("active_colour_preview"):
+            dpg.set_value("active_colour_preview", list(active))
+        if dpg.does_item_exist("active_colour_picker"):
+            dpg.set_value("active_colour_picker", list(active))
+        if dpg.does_item_exist("active_colour_hex_label"):
+            dpg.set_value("active_colour_hex_label", rgb_hex(active))
+        if dpg.does_item_exist("colour_popup_hex_label"):
+            dpg.set_value("colour_popup_hex_label", rgba_hex(active))
+        if dpg.does_item_exist("active_colour_hex_input"):
+            dpg.set_value("active_colour_hex_input", rgba_hex(active))
+
+    def _on_hex_entered(self, _sender: int, app_data: str) -> None:
+        parsed = parse_hex_color(str(app_data or ""))
+        if parsed is None:
+            self._set_status("Invalid hex colour — use #RRGGBB or #RRGGBBAA")
+            self._sync_active_colour_ui()
+            return
+        self.state.active_colour = parsed
+        self._sync_active_colour_ui()
 
     def _build_right_sidebar(self) -> None:
         with dpg.child_window(width=360, height=-1, tag="ai_panel"):
@@ -1137,10 +1246,11 @@ class TexturePainterApp:
 
     def _select_palette_colour(self, index: int) -> None:
         self.state.active_colour = PALETTE[index]
-        dpg.set_value("active_colour_picker", list(self.state.active_colour))
+        self._sync_active_colour_ui()
 
     def _on_custom_colour(self, _sender: int, app_data: list[float]) -> None:
         self.state.active_colour = _normalise_picker_colour(app_data)
+        self._sync_active_colour_ui()
 
     def _clear_face_selection(self) -> None:
         self.state.selected_faces.clear()
@@ -1932,7 +2042,7 @@ class TexturePainterApp:
         tool = self.state.paint_tool
         if tool == "sample":
             self.state.active_colour = self.mesh_model.face_colour(pick.face_id)
-            dpg.set_value("active_colour_picker", list(self.state.active_colour))
+            self._sync_active_colour_ui()
             self._set_status(f"Sampled face {pick.face_id}")
             return
         if tool == "mask":

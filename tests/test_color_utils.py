@@ -8,7 +8,9 @@ from stl_painter.color_utils import (
     blend_over,
     clamp_color,
     normalize_rgba,
+    parse_hex_color,
     rgb_hex,
+    rgba_hex,
 )
 
 
@@ -107,3 +109,25 @@ def test_blend_over_alpha_255() -> None:
 def test_default_color_is_defined() -> None:
     assert DEFAULT_COLOR == (176, 184, 196, 255)
     assert len(DEFAULT_COLOR) == 4
+
+
+def test_parse_hex_color_rgb() -> None:
+    assert parse_hex_color("#FF8000") == (255, 128, 0, 255)
+
+
+def test_parse_hex_color_without_hash_and_lowercase() -> None:
+    assert parse_hex_color("ff8000") == (255, 128, 0, 255)
+
+
+def test_parse_hex_color_rgba() -> None:
+    assert parse_hex_color("#FF800080") == (255, 128, 0, 128)
+
+
+def test_parse_hex_color_rejects_invalid() -> None:
+    assert parse_hex_color("not-a-colour") is None
+    assert parse_hex_color("#FFF") is None
+    assert parse_hex_color("") is None
+
+
+def test_rgba_hex_round_trip() -> None:
+    assert parse_hex_color(rgba_hex((255, 128, 0, 128))) == (255, 128, 0, 128)

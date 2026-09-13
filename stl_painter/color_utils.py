@@ -21,6 +21,31 @@ def rgb_hex(color: Color | tuple[int, int, int]) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def rgba_hex(color: Color | tuple[int, int, int]) -> str:
+    values = list(color[:4])
+    while len(values) < 4:
+        values.append(255)
+    r, g, b, a = (max(0, min(255, int(round(v)))) for v in values)
+    return f"#{r:02X}{g:02X}{b:02X}{a:02X}"
+
+
+def parse_hex_color(text: str) -> Color | None:
+    """Parse ``#RRGGBB`` / ``#RRGGBBAA`` (``#`` optional) into an RGBA colour.
+
+    Returns ``None`` when the text is not a valid hex colour.
+    """
+    cleaned = str(text or "").strip().lstrip("#").strip()
+    if len(cleaned) not in (6, 8):
+        return None
+    try:
+        values = [int(cleaned[i : i + 2], 16) for i in range(0, len(cleaned), 2)]
+    except ValueError:
+        return None
+    if len(values) == 3:
+        values.append(255)
+    return clamp_color(tuple(values))
+
+
 def normalize_rgba(color: Color) -> tuple[float, float, float, float]:
     return tuple(component / 255.0 for component in color)  # type: ignore[return-value]
 

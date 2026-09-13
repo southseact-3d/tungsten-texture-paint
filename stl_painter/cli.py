@@ -322,7 +322,7 @@ def _add_io(
         "--input", "-i",
         required=True,
         metavar="PATH",
-        help="Input file: STL / OBJ / GLB / GLTF / 3MF / PLY / FBX / BLEND / .tg3d",
+        help="Input file: STL / OBJ / GLB / GLTF / 3MF / PLY / FBX / BLEND / STEP / STP / .tg3d",
     )
     if output:
         p.add_argument(

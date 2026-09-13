@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import zipfile
 from pathlib import Path
@@ -21,7 +22,10 @@ SUPPORTED_IMPORT_EXTENSIONS = {
     ".ply",
     ".fbx",
     ".blend",
+    ".step",
+    ".stp",
 }
+STEP_IMPORT_EXTENSIONS = {".step", ".stp"}
 
 
 def _coerce_trimesh(loaded: trimesh.Trimesh | trimesh.Scene) -> trimesh.Trimesh:
@@ -332,6 +336,27 @@ def _apply_face_colors_to_trimesh(
     mesh.visual = ColorVisuals(face_colors=rgba)
 
 
+def load_step_npz(npz_path: str | Path, *, source_path: str | None = None) -> MeshModel:
+    """Build a CAD-face-preserving model from :mod:`step_to_mesh` output."""
+    data = np.load(npz_path, allow_pickle=False)
+    cad_meta = json.loads(str(data["cad_meta"]))
+    mesh_model = MeshModel.from_cad_arrays(
+        np.asarray(data["vertices"]),
+        np.asarray(data["faces"]),
+        np.asarray(data["tri_cad"]),
+        cad_meta,
+        source_path=source_path,
+    )
+    logger.info(
+        "Prepared CAD model | triangles=%s | cad_faces=%s | solids=%s | source=%s",
+        mesh_model.face_count,
+        mesh_model.cad_face_count,
+        mesh_model.cad_solid_count,
+        source_path,
+    )
+    return mesh_model
+
+
 def load_model(path: str | Path) -> MeshModel:
     source_path = str(path)
     extension = Path(path).suffix.lower()
@@ -340,6 +365,23 @@ def load_model(path: str | Path) -> MeshModel:
             f"Unsupported import format '{extension}'. Supported: {sorted(SUPPORTED_IMPORT_EXTENSIONS)}"
         )
     logger.info("Loading model from %s", source_path)
+
+    # STEP files are tessellated per CAD face via an external CadQuery
+    # Python (not bundled) to a temp .npz first. Triangles stay mapped to
+    # their CAD faces so preview/picking/painting work on whole CAD faces.
+    if extension in STEP_IMPORT_EXTENSIONS:
+        from .step_convert import convert_step_to_npz
+
+        with convert_step_to_npz(source_path) as npz_path:
+            mesh_model = load_step_npz(npz_path, source_path=source_path)
+        logger.info(
+            "Prepared mesh model | faces=%s | vertices=%s | cad_faces=%s | source=%s",
+            mesh_model.face_count,
+            mesh_model.vertex_count,
+            mesh_model.cad_face_count,
+            source_path,
+        )
+        return mesh_model
 
     # .blend files are converted via headless Blender to a temp .glb first.
     if extension == ".blend":

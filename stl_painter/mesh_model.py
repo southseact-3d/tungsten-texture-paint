@@ -8,7 +8,7 @@ import trimesh
 
 from .color_utils import DEFAULT_COLOR, Color, clamp_color
 
-PROJECT_VERSION = 4
+PROJECT_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -123,9 +123,19 @@ class MeshModel:
     face_groups: dict[str, list[int]] = field(default_factory=dict)
     face_to_group: dict[int, str] = field(default_factory=dict)
     model_scale: float = 1.0
+    # STEP/CAD imports only: per-triangle index into ``cad_faces`` order plus
+    # per-CAD-face metadata (``{id, solid, name, surface}``). The GPU/3MF mesh
+    # underneath is still triangles, but preview/picking/painting operate on
+    # whole CAD faces so rectangles and circles keep their shape.
+    tri_to_cad: np.ndarray | None = field(default=None)
+    cad_faces: dict[str, dict[str, Any]] = field(default_factory=dict)
     _adjacency: dict[int, set[int]] | None = field(default=None, init=False, repr=False)
     _mesh_cache: trimesh.Trimesh | None = field(default=None, init=False, repr=False)
     _face_centers: np.ndarray | None = field(default=None, init=False, repr=False)
+    _cad_boundary: np.ndarray | None = field(default=None, init=False, repr=False)
+    _cad_boundary_set: set[tuple[int, int]] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.vertices = np.asarray(self.vertices, dtype=np.float32)
@@ -146,6 +156,16 @@ class MeshModel:
             for face_id, group_id in self.face_to_group.items()
         }
         self.model_scale = float(self.model_scale)
+        if self.tri_to_cad is not None:
+            self.tri_to_cad = np.asarray(self.tri_to_cad, dtype=np.int32).reshape(-1)
+            if self.tri_to_cad.shape != (self.faces.shape[0],):
+                raise ValueError(
+                    "Expected tri_to_cad shaped "
+                    f"({self.faces.shape[0]},), got {self.tri_to_cad.shape}"
+                )
+        self.cad_faces = {
+            str(cad_id): dict(meta) for cad_id, meta in self.cad_faces.items()
+        }
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError(
                 f"Expected vertices shaped (n, 3), got {self.vertices.shape}"
@@ -244,6 +264,154 @@ class MeshModel:
             face_colours=face_colours,
             source_path=source_path,
         )
+
+    @classmethod
+    def from_cad_arrays(
+        cls,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        tri_to_cad: np.ndarray,
+        cad_meta: list[dict[str, Any]],
+        *,
+        source_path: str | None = None,
+    ) -> "MeshModel":
+        """Build a model from per-CAD-face tessellation (STEP import).
+
+        ``tri_to_cad`` maps every triangle to its index in ``cad_meta``. No
+        dedup/merge cleanup runs here (unlike :meth:`from_trimesh`) because
+        any face dropping or reordering would break the triangle-to-CAD-face
+        alignment; OCC tessellation output is already clean.
+        """
+        verts = np.asarray(vertices, dtype=np.float32)
+        tris = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+        mapping = np.asarray(tri_to_cad, dtype=np.int32).reshape(-1)
+        if len(tris) == 0:
+            raise ValueError("CAD tessellation produced no triangles")
+        if mapping.shape != (len(tris),):
+            raise ValueError(
+                f"tri_to_cad length {mapping.shape} does not match "
+                f"triangle count {len(tris)}"
+            )
+        if int(mapping.min()) < 0 or int(mapping.max()) >= len(cad_meta):
+            raise ValueError("tri_to_cad references unknown CAD face indices")
+        triangles = verts[tris]
+        cross = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+        lengths = np.linalg.norm(cross, axis=1, keepdims=True)
+        safe_lengths = np.where(lengths > 1e-12, lengths, 1.0)
+        normals = (cross / safe_lengths).astype(np.float32)
+        cad_faces: dict[str, dict[str, Any]] = {}
+        face_groups: dict[str, list[int]] = {}
+        face_to_group: dict[int, str] = {}
+        for index, meta in enumerate(cad_meta):
+            cad_id = str(meta.get("id", f"cad_{index}"))
+            cad_faces[cad_id] = {
+                "index": int(index),
+                "solid": int(meta.get("solid", 0)),
+                "name": str(meta.get("name", cad_id)),
+                "surface": str(meta.get("surface", "UNKNOWN")),
+            }
+            members = sorted(int(i) for i in np.flatnonzero(mapping == index))
+            face_groups[cad_id] = members
+            for face_id in members:
+                face_to_group[face_id] = cad_id
+        return cls(
+            vertices=verts,
+            faces=tris,
+            normals=normals,
+            tri_to_cad=mapping,
+            cad_faces=cad_faces,
+            face_groups=face_groups,
+            face_to_group=face_to_group,
+            source_path=source_path,
+        )
+
+    @property
+    def has_cad_faces(self) -> bool:
+        return self.tri_to_cad is not None and len(self.cad_faces) > 0
+
+    @property
+    def cad_face_count(self) -> int:
+        return len(self.cad_faces)
+
+    @property
+    def cad_solid_count(self) -> int:
+        if not self.cad_faces:
+            return 0
+        return len({meta.get("solid", 0) for meta in self.cad_faces.values()})
+
+    def cad_id_for_face(self, face_id: int) -> str | None:
+        if self.tri_to_cad is None:
+            return None
+        face_id = int(face_id)
+        if not 0 <= face_id < self.face_count:
+            return None
+        ordered = sorted(self.cad_faces.items(), key=lambda item: int(item[1].get("index", -1)))
+        index = int(self.tri_to_cad[face_id])
+        if 0 <= index < len(ordered):
+            return ordered[index][0]
+        return None
+
+    def faces_for_cad(self, cad_id: str) -> list[int]:
+        meta = self.cad_faces.get(str(cad_id))
+        if meta is None or self.tri_to_cad is None:
+            return []
+        return sorted(int(i) for i in np.flatnonzero(self.tri_to_cad == int(meta.get("index", -1))))
+
+    def cad_boundary_edges(self) -> np.ndarray:
+        """Vertex-index pairs forming CAD-face outlines (no triangulation diagonals).
+
+        An edge is kept when it borders one triangle only, or when its
+        incident triangles belong to different CAD faces. Cached; stored as
+        vertex indices so uniform scaling needs no invalidation.
+        """
+        if self._cad_boundary is not None:
+            return self._cad_boundary
+        if self.tri_to_cad is None:
+            self._cad_boundary = np.zeros((0, 2), dtype=np.int32)
+            self._cad_boundary_set = set()
+            return self._cad_boundary
+        faces = np.asarray(self.faces, dtype=np.int64)
+        edge_map: dict[tuple[int, int], list[int]] = {}
+        for face_id in range(len(faces)):
+            a, b, c = (int(faces[face_id, 0]), int(faces[face_id, 1]), int(faces[face_id, 2]))
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (u, v) if u < v else (v, u)
+                entry = edge_map.get(key)
+                if entry is None:
+                    edge_map[key] = [face_id]
+                else:
+                    entry.append(face_id)
+        kept: list[tuple[int, int]] = []
+        for key, members in edge_map.items():
+            if len(members) == 1:
+                kept.append(key)
+                continue
+            first = int(self.tri_to_cad[members[0]])
+            if any(int(self.tri_to_cad[other]) != first for other in members[1:]):
+                kept.append(key)
+        self._cad_boundary = np.asarray(kept, dtype=np.int32).reshape(-1, 2)
+        self._cad_boundary_set = set(kept)
+        return self._cad_boundary
+
+    def cad_face_boundary_edges(self, cad_id: str) -> np.ndarray:
+        """Boundary edges (vertex-index pairs) outlining one CAD face."""
+        members = self.faces_for_cad(cad_id)
+        if not members:
+            return np.zeros((0, 2), dtype=np.int32)
+        boundary = self.cad_boundary_edges()
+        wanted = self._cad_boundary_set or set()
+        faces = np.asarray(self.faces, dtype=np.int64)
+        candidate_keys: set[tuple[int, int]] = set()
+        for face_id in members:
+            a, b, c = (int(faces[face_id, 0]), int(faces[face_id, 1]), int(faces[face_id, 2]))
+            for u, v in ((a, b), (b, c), (c, a)):
+                candidate_keys.add((u, v) if u < v else (v, u))
+        kept = [key for key in candidate_keys if key in wanted]
+        if not kept:
+            return np.zeros((0, 2), dtype=np.int32)
+        index_of = {key: i for i, key in enumerate(map(tuple, boundary.tolist()))}
+        kept.sort(key=lambda key: index_of.get(key, 0))
+        return np.asarray(kept, dtype=np.int32).reshape(-1, 2)
 
     def scale_uniform(self, factor: float) -> None:
         if factor <= 0:
@@ -464,6 +632,14 @@ class MeshModel:
                 for face_id, group_id in self.face_to_group.items()
             },
             "model_scale": self.model_scale,
+            "tri_to_cad": (
+                None
+                if self.tri_to_cad is None
+                else [int(value) for value in self.tri_to_cad.tolist()]
+            ),
+            "cad_faces": {
+                cad_id: dict(meta) for cad_id, meta in self.cad_faces.items()
+            },
         }
 
     @classmethod
@@ -511,6 +687,11 @@ class MeshModel:
                 for face_id, group_id in payload.get("face_to_group", {}).items()
             },
             model_scale=float(payload.get("model_scale", 1.0)),
+            tri_to_cad=payload.get("tri_to_cad"),
+            cad_faces={
+                str(cad_id): dict(meta)
+                for cad_id, meta in payload.get("cad_faces", {}).items()
+            },
         )
 
     def to_project_delta(
@@ -583,4 +764,8 @@ class MeshModel:
             face_groups=delta.get("face_groups", base.face_groups),
             face_to_group=delta.get("face_to_group", base.face_to_group),
             model_scale=float(delta.get("model_scale", base.model_scale)),
+            tri_to_cad=(
+                None if base.tri_to_cad is None else base.tri_to_cad.copy()
+            ),
+            cad_faces={cad_id: dict(meta) for cad_id, meta in base.cad_faces.items()},
         )

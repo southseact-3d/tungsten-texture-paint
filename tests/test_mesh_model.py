@@ -204,12 +204,25 @@ def test_mesh_model_sketch_document_serialization(square_mesh) -> None:
 
 
 def test_mesh_model_to_project_dict(square_mesh) -> None:
+    from stl_painter.mesh_model import PROJECT_VERSION
+
     square_mesh.set_face_colour(0, (255, 0, 0, 255))
     data = square_mesh.to_project_dict()
-    assert data["project_version"] == 4
+    assert data["project_version"] == PROJECT_VERSION
     assert "vertices" in data
     assert "faces" in data
     assert "face_colours" in data
+
+
+def test_project_dict_v4_without_cad_fields_loads(square_mesh) -> None:
+    """Pre-STEP (v4) payloads without CAD keys still load with no CAD mapping."""
+    data = square_mesh.to_project_dict()
+    data["project_version"] = 4
+    data.pop("tri_to_cad", None)
+    data.pop("cad_faces", None)
+    restored = MeshModel.from_project_dict(data)
+    assert restored.face_count == square_mesh.face_count
+    assert not restored.has_cad_faces
 
 
 def test_mesh_model_from_project_dict(square_mesh) -> None:

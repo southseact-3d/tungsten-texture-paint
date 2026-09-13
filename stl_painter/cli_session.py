@@ -38,7 +38,7 @@ class CLISession:
     # ------------------------------------------------------------------
 
     def load(self, path: str | Path) -> MeshModel:
-        """Load an STL/OBJ/GLB or .tg3d file into this session."""
+        """Load a mesh (STL/OBJ/GLB/STEP/...) or .tg3d file into this session."""
         p = Path(path)
         if p.suffix.lower() == ".tg3d":
             base_model, timeline = load_tg3d(p)

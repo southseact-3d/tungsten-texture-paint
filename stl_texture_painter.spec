@@ -9,6 +9,7 @@ datas = [
     (str(project_root / "stl_painter" / "shaders"), "stl_painter/shaders"),
     (str(project_root / "stl_painter" / "assets"), "stl_painter/assets"),
     (str(project_root / "stl_painter" / "blend_to_glb.py"), "stl_painter"),
+    (str(project_root / "stl_painter" / "step_to_mesh.py"), "stl_painter"),
 ]
 binaries = []
 hiddenimports = [

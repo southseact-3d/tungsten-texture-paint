@@ -188,7 +188,7 @@ class MeshRenderer:
                 [positions, normals, colours], axis=1
             ).astype("f4")
             self._mesh_vbo = self.ctx.buffer(self._colour_vertices.tobytes())
-            edge_positions = self._full_triangle_edge_positions()
+            edge_positions = self._edge_positions()
             self._edge_vbo = self.ctx.buffer(edge_positions.astype("f4").tobytes())
             self._position_vbo = self.ctx.buffer(positions.tobytes())
             self._face_id_vbo = self.ctx.buffer(face_ids.tobytes())
@@ -269,19 +269,39 @@ class MeshRenderer:
             axis=1,
         ).reshape(-1, 3)
 
+    def _cad_boundary_edge_positions(self) -> np.ndarray:
+        """CAD-face outline edges as line-list positions (2 verts per edge).
+
+        STEP models hide triangulation: only edges between different CAD
+        faces (plus naked borders) are drawn, so rectangles render as
+        rectangles and circles as circles.
+        """
+        edges = self.mesh_model.cad_boundary_edges()
+        if len(edges) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        return self.mesh_model.vertices[np.asarray(edges)].reshape(-1, 3).astype(
+            np.float32
+        )
+
+    def _edge_positions(self) -> np.ndarray:
+        if self.mesh_model.has_cad_faces:
+            return self._cad_boundary_edge_positions()
+        return self._full_triangle_edge_positions()
+
     def rebuild_edge_buffer(self) -> None:
         if not self._gpu_ready or self.ctx is None:
             logger.debug("rebuild_edge_buffer: GPU not ready or no context")
             return
-        edge_positions_arr = self._full_triangle_edge_positions().astype("f4")
+        edge_positions_arr = self._edge_positions().astype("f4")
         self._edge_vbo = self.ctx.buffer(edge_positions_arr.tobytes())
         self._edge_vao = self.ctx.vertex_array(
             self._edge_program,
             [(self._edge_vbo, "3f", "in_position")],
         )
         logger.debug(
-            "rebuild_edge_buffer: created %d triangle edges for %d faces",
+            "rebuild_edge_buffer: created %d %s edges for %d faces",
             len(edge_positions_arr) // 2,
+            "CAD boundary" if self.mesh_model.has_cad_faces else "triangle",
             self.mesh_model.face_count,
         )
 
@@ -476,6 +496,28 @@ class MeshRenderer:
             return width, height
         return max(320, int(width * scale)), max(240, int(height * scale))
 
+    def _project_vertices(
+        self, camera: OrbitCamera, screen_size: tuple[int, int]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Project all mesh vertices to screen pixels.
+
+        Returns ``(screen, valid)`` with ``screen`` shaped ``(V, 2)`` and a
+        per-vertex validity mask. Used by face projection and by CAD
+        boundary-edge drawing in the software renderer.
+        """
+        vertices = self.mesh_model.vertices
+        width, height = screen_size
+        mvp = camera.mvp_matrix(self.viewport_size)
+        clip = (mvp @ np.c_[vertices, np.ones(len(vertices), dtype=np.float32)].T).T
+        w = clip[:, 3:4]
+        safe_w = np.where(np.abs(w) < 1e-6, 1e-6, w)
+        ndc = clip[:, :3] / safe_w
+        valid_vertices = np.isfinite(ndc).all(axis=1)
+        screen = np.empty((len(vertices), 2), dtype=np.float32)
+        screen[:, 0] = (ndc[:, 0] * 0.5 + 0.5) * width
+        screen[:, 1] = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height
+        return screen, valid_vertices
+
     def _project_faces(
         self,
         camera: OrbitCamera,
@@ -574,12 +616,23 @@ class MeshRenderer:
             draw.polygon(
                 points, fill=(int(lit[0]), int(lit[1]), int(lit[2]), int(base[3]))
             )
-            if show_triangle_edges:
+            if show_triangle_edges and not self.mesh_model.has_cad_faces:
                 draw.line(
                     points + [points[0]],
                     fill=(0, 0, 0, 255),
                     width=1,
                 )
+
+        if show_triangle_edges and self.mesh_model.has_cad_faces:
+            # STEP models: outline CAD faces only, never triangulation.
+            screen, valid = self._project_vertices(camera, render_size)
+            for u, v in self.mesh_model.cad_boundary_edges().tolist():
+                if valid[u] and valid[v]:
+                    draw.line(
+                        [tuple(screen[u]), tuple(screen[v])],
+                        fill=(0, 0, 0, 255),
+                        width=1,
+                    )
 
         if render_size != self.viewport_size:
             image = image.resize(self.viewport_size, Image.Resampling.BILINEAR)

@@ -23,6 +23,11 @@ def migrate_project_payload(payload: dict[str, object]) -> dict[str, object]:
     if version < 4:
         migrated.setdefault("model_scale", 1.0)
         migrated["project_version"] = 4
+        version = 4
+    if version < 5:
+        migrated.setdefault("tri_to_cad", None)
+        migrated.setdefault("cad_faces", {})
+        migrated["project_version"] = 5
     if int(migrated.get("project_version", 1)) != PROJECT_VERSION:
         raise ValueError(
             f"Unsupported project version {migrated.get('project_version')} (expected {PROJECT_VERSION})"

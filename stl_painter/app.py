@@ -167,7 +167,7 @@ class TexturePainterApp:
                     (
                         "3D Files",
                         "*.stl *.obj *.glb *.gltf *.3mf *.ply *.fbx *.blend "
-                        "*.tg3d *.json",
+                        "*.step *.stp *.tg3d *.json",
                     ),
                     ("All files", "*.*"),
                 ],
@@ -184,7 +184,8 @@ class TexturePainterApp:
                 filetypes=[
                     (
                         "3D Files",
-                        "*.stl *.obj *.glb *.gltf *.3mf *.ply *.fbx *.blend",
+                        "*.stl *.obj *.glb *.gltf *.3mf *.ply *.fbx *.blend "
+                        "*.step *.stp",
                     ),
                     ("All files", "*.*"),
                 ],
@@ -1306,10 +1307,19 @@ class TexturePainterApp:
         self.paint_tool = PaintTool(mesh_model)
         self.commands.attach(mesh_model, self.paint_tool)
         self._mark_viewport_dirty()
-        dpg.set_value(
-            "mesh_info_text",
-            f"{Path(mesh_model.source_path or 'project').name}\nFaces: {mesh_model.face_count}\nVertices: {mesh_model.vertex_count}\nMasked: {len(mesh_model.masked_faces)}\nScale: {mesh_model.model_scale:.4f}x",
-        )
+        info_lines = [
+            f"{Path(mesh_model.source_path or 'project').name}",
+            f"Faces: {mesh_model.face_count}",
+            f"Vertices: {mesh_model.vertex_count}",
+        ]
+        if mesh_model.has_cad_faces:
+            info_lines.append(
+                f"CAD faces: {mesh_model.cad_face_count} "
+                f"({mesh_model.cad_solid_count} solids)"
+            )
+        info_lines.append(f"Masked: {len(mesh_model.masked_faces)}")
+        info_lines.append(f"Scale: {mesh_model.model_scale:.4f}x")
+        dpg.set_value("mesh_info_text", "\n".join(info_lines))
         dpg.set_value("model_scale_factor", 1.0)
         dpg.set_value("face_groups_count_text", f"Groups: {group_count}")
         self._refresh_mask_count()
@@ -1760,6 +1770,9 @@ class TexturePainterApp:
         face_id = int(self.state.hovered_face)
         if not 0 <= face_id < self.mesh_model.face_count:
             return
+        if self.mesh_model.has_cad_faces:
+            self._overlay_hovered_cad_face(rgba, face_id)
+            return
         corners = [
             self._project_world_to_screen(vertex)
             for vertex in self.mesh_model.face_vertices(face_id)
@@ -1771,6 +1784,21 @@ class TexturePainterApp:
         self._draw_line(rgba, p0, p1, (0.2, 0.95, 0.95), alpha=0.95)
         self._draw_line(rgba, p1, p2, (0.2, 0.95, 0.95), alpha=0.95)
         self._draw_line(rgba, p2, p0, (0.2, 0.95, 0.95), alpha=0.95)
+
+    def _overlay_hovered_cad_face(self, rgba: np.ndarray, face_id: int) -> None:
+        """Outline the whole hovered CAD face (boundary loop, no diagonals)."""
+        assert self.mesh_model is not None
+        cad_id = self.mesh_model.cad_id_for_face(face_id)
+        if cad_id is None:
+            return
+        edges = self.mesh_model.cad_face_boundary_edges(cad_id)
+        vertices = self.mesh_model.vertices
+        for u, v in edges[:4000].tolist():
+            p0 = self._project_world_to_screen(vertices[int(u)])
+            p1 = self._project_world_to_screen(vertices[int(v)])
+            if p0 is None or p1 is None:
+                continue
+            self._draw_line(rgba, p0, p1, (0.2, 0.95, 0.95), alpha=0.95)
 
     def _overlay_selected_faces(self, rgba: np.ndarray) -> None:
         if self.mesh_model is None:
@@ -1919,7 +1947,26 @@ class TexturePainterApp:
             self._apply_updates(touched)
             self._refresh_mask_count()
             return
-        if tool == "fill":
+        cad_painted = False
+        if self.mesh_model.has_cad_faces and tool in ("brush", "erase", "fill"):
+            # STEP models paint whole CAD faces so colour boundaries follow
+            # the CAD shape (rectangles/circles), never triangulation.
+            cad_id = self.mesh_model.cad_id_for_face(pick.face_id)
+            if cad_id is None:
+                self._set_status("No change — face already has this colour")
+                return
+            group_colour = (
+                self.state.active_colour
+                if tool != "erase"
+                else self.mesh_model.default_colour
+            )
+            updates = {
+                face_id: group_colour
+                for face_id in self.mesh_model.faces_for_cad(cad_id)
+                if face_id not in self.mesh_model.masked_faces
+            }
+            cad_painted = True
+        elif tool == "fill":
             updates = self.paint_tool.flood_fill_updates(
                 pick.face_id,
                 self.state.active_colour,
@@ -1945,7 +1992,12 @@ class TexturePainterApp:
                 angle_tolerance_degrees=self.state.brush.angle_tolerance_degrees,
                 erase=(tool == "erase"),
             )
-        if self.state.paint_linked_faces and self.mesh_model is not None and updates:
+        if (
+            not cad_painted
+            and self.state.paint_linked_faces
+            and self.mesh_model is not None
+            and updates
+        ):
             group_id = self.mesh_model.group_for_face(pick.face_id)
             if group_id is not None:
                 grouped_faces = self.mesh_model.faces_for_group(group_id)
@@ -2527,6 +2579,11 @@ class TexturePainterApp:
     def _on_group_faces(self) -> None:
         if self.mesh_model is None:
             self._set_status("No mesh loaded")
+            return
+        if self.mesh_model.has_cad_faces:
+            self._set_status(
+                "STEP model already groups per CAD face — regroup skipped"
+            )
             return
         angle_tolerance = self.state.brush.angle_tolerance_degrees
         self.mesh_model.compute_face_groups(angle_tolerance_degrees=angle_tolerance)

@@ -136,6 +136,16 @@ class MeshModel:
     _cad_boundary_set: set[tuple[int, int]] | None = field(
         default=None, init=False, repr=False
     )
+    _cad_index_to_id: list[str] | None = field(
+        default=None, init=False, repr=False
+    )
+    _cad_edge_faces: list[list[int]] | None = field(
+        default=None, init=False, repr=False
+    )
+    _cad_edge_padded: np.ndarray | None = field(
+        default=None, init=False, repr=False
+    )
+    _ray_mesh: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.vertices = np.asarray(self.vertices, dtype=np.float32)
@@ -166,6 +176,16 @@ class MeshModel:
         self.cad_faces = {
             str(cad_id): dict(meta) for cad_id, meta in self.cad_faces.items()
         }
+        # Ordered index->id table so cad_id_for_face() is O(1) with no
+        # per-call sorting (hot path: paint, hover, visibility, render).
+        self._cad_index_to_id = None
+        self._cad_edge_faces = None
+        if self.tri_to_cad is not None and self.cad_faces:
+            ordered = sorted(
+                self.cad_faces.items(),
+                key=lambda item: int(item[1].get("index", -1)),
+            )
+            self._cad_index_to_id = [cad_id for cad_id, _ in ordered]
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError(
                 f"Expected vertices shaped (n, 3), got {self.vertices.shape}"
@@ -345,17 +365,49 @@ class MeshModel:
         face_id = int(face_id)
         if not 0 <= face_id < self.face_count:
             return None
-        ordered = sorted(self.cad_faces.items(), key=lambda item: int(item[1].get("index", -1)))
+        table = self._cad_index_to_id
+        if table is None:
+            ordered = sorted(
+                self.cad_faces.items(),
+                key=lambda item: int(item[1].get("index", -1)),
+            )
+            table = [cad_id for cad_id, _ in ordered]
+            self._cad_index_to_id = table
         index = int(self.tri_to_cad[face_id])
-        if 0 <= index < len(ordered):
-            return ordered[index][0]
+        if 0 <= index < len(table):
+            return table[index]
         return None
 
     def faces_for_cad(self, cad_id: str) -> list[int]:
-        meta = self.cad_faces.get(str(cad_id))
+        key = str(cad_id)
+        members = self.face_groups.get(key)
+        if members is not None:
+            return list(members)
+        meta = self.cad_faces.get(key)
         if meta is None or self.tri_to_cad is None:
             return []
         return sorted(int(i) for i in np.flatnonzero(self.tri_to_cad == int(meta.get("index", -1))))
+
+    def _build_edge_table(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Unique sorted edges plus per-occurrence face ids (numpy, cached use).
+
+        Returns ``(unique_edges, occurrence_faces, inverse)`` where
+        ``unique_edges`` is ``(E, 2)`` int64, ``occurrence_faces`` maps each
+        of the ``3F`` edge slots to its face id, and ``inverse`` maps each
+        slot to its unique-edge row. Vectorized via ``np.unique`` so a
+        285k-face mesh builds in ~0.3s instead of seconds of Python loops.
+        """
+        faces = np.asarray(self.faces, dtype=np.int64).reshape(-1, 3)
+        raw = np.stack(
+            [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]],
+            axis=1,
+        ).reshape(-1, 2)
+        raw.sort(axis=1)
+        unique, inverse = np.unique(raw, axis=0, return_inverse=True)
+        occurrence_faces = np.repeat(
+            np.arange(len(faces), dtype=np.int64), 3
+        )
+        return unique, occurrence_faces, inverse
 
     def cad_boundary_edges(self) -> np.ndarray:
         """Vertex-index pairs forming CAD-face outlines (no triangulation diagonals).
@@ -369,29 +421,80 @@ class MeshModel:
         if self.tri_to_cad is None:
             self._cad_boundary = np.zeros((0, 2), dtype=np.int32)
             self._cad_boundary_set = set()
+            self._cad_edge_faces = []
             return self._cad_boundary
-        faces = np.asarray(self.faces, dtype=np.int64)
-        edge_map: dict[tuple[int, int], list[int]] = {}
-        for face_id in range(len(faces)):
-            a, b, c = (int(faces[face_id, 0]), int(faces[face_id, 1]), int(faces[face_id, 2]))
-            for u, v in ((a, b), (b, c), (c, a)):
-                key = (u, v) if u < v else (v, u)
-                entry = edge_map.get(key)
-                if entry is None:
-                    edge_map[key] = [face_id]
-                else:
-                    entry.append(face_id)
-        kept: list[tuple[int, int]] = []
-        for key, members in edge_map.items():
-            if len(members) == 1:
-                kept.append(key)
-                continue
-            first = int(self.tri_to_cad[members[0]])
-            if any(int(self.tri_to_cad[other]) != first for other in members[1:]):
-                kept.append(key)
-        self._cad_boundary = np.asarray(kept, dtype=np.int32).reshape(-1, 2)
-        self._cad_boundary_set = set(kept)
+        unique, occurrence_faces, inverse = self._build_edge_table()
+        counts = np.bincount(inverse, minlength=len(unique))
+        order = np.argsort(inverse, kind="stable")
+        sorted_faces = occurrence_faces[order]
+        starts = np.zeros(len(unique), dtype=np.int64)
+        starts[1:] = np.cumsum(counts[:-1])
+        tri_cad = np.asarray(self.tri_to_cad, dtype=np.int64)
+        # Vectorized keep decision: naked edges (count==1) always kept;
+        # count==2 edges kept when the two triangles differ in CAD id
+        # (covers ~99% of rows with no Python loop); higher-count
+        # non-manifold edges fall back to a short loop over those rows only.
+        keep = counts == 1
+        pair_rows = np.flatnonzero(counts == 2)
+        if len(pair_rows):
+            first = sorted_faces[starts[pair_rows]].astype(np.int64)
+            second = sorted_faces[starts[pair_rows] + 1].astype(np.int64)
+            keep[pair_rows] = tri_cad[first] != tri_cad[second]
+        multi_rows = np.flatnonzero(counts > 2)
+        for row in multi_rows.tolist():
+            s = int(starts[int(row)])
+            members = sorted_faces[s : s + int(counts[int(row)])]
+            first_cad = int(tri_cad[int(members[0])])
+            if any(int(tri_cad[int(other)]) != first_cad for other in members[1:]):
+                keep[int(row)] = True
+        kept_rows = np.flatnonzero(keep)
+        boundary = unique[keep].astype(np.int32).reshape(-1, 2)
+        self._cad_boundary = boundary
+        self._cad_boundary_set = {tuple(int(v) for v in row) for row in boundary.tolist()}
+        self._cad_edge_faces = [
+            [int(v) for v in sorted_faces[int(starts[row]) : int(starts[row]) + int(counts[row])].tolist()]
+            for row in kept_rows.tolist()
+        ]
+        self._cad_edge_padded = None
         return self._cad_boundary
+
+    def cad_boundary_with_faces(self) -> tuple[np.ndarray, list[list[int]]]:
+        """Boundary edges plus their incident triangle ids (cached, aligned).
+
+        Lets the renderer filter front-facing CAD edges with pure numpy
+        instead of rebuilding an ``edge -> faces`` dict over all 285k
+        triangles on every camera move.
+        """
+        boundary = self.cad_boundary_edges()
+        faces = self._cad_edge_faces
+        if faces is None or len(faces) != len(boundary):
+            # Re-derive conservatively (should not happen when cached).
+            return boundary, [[] for _ in range(len(boundary))]
+        return boundary, faces
+
+    def cad_boundary_incident_padded(self) -> np.ndarray:
+        """Incident-face matrix ``(B, K)`` padded with ``-1`` (cached).
+
+        Built once from :meth:`cad_boundary_with_faces` so the renderer's
+        per-frame front-face filter is a single vectorized mask lookup
+        with no Python loops at all.
+        """
+        if self._cad_edge_padded is not None:
+            return self._cad_edge_padded
+        _, incident = self.cad_boundary_with_faces()
+        width = 0
+        for members in incident:
+            if len(members) > width:
+                width = len(members)
+        if width == 0:
+            self._cad_edge_padded = np.zeros((0, 1), dtype=np.int64)
+            return self._cad_edge_padded
+        padded = np.full((len(incident), width), -1, dtype=np.int64)
+        for row, members in enumerate(incident):
+            if members:
+                padded[row, : len(members)] = np.asarray(members, dtype=np.int64)
+        self._cad_edge_padded = padded
+        return padded
 
     def cad_face_boundary_edges(self, cad_id: str) -> np.ndarray:
         """Boundary edges (vertex-index pairs) outlining one CAD face."""
@@ -419,6 +522,7 @@ class MeshModel:
         self.vertices = (self.vertices * float(factor)).astype(np.float32)
         self.model_scale *= float(factor)
         self._mesh_cache = None
+        self._ray_mesh = None
         self._face_centers = None
 
     def map_colours_from(
@@ -476,36 +580,102 @@ class MeshModel:
             )
         return self._mesh_cache.copy()
 
+    def mesh_for_ray(self) -> trimesh.Trimesh:
+        """Shared trimesh for ray picking with a persistent spatial index.
+
+        :meth:`mesh` returns a copy per call, which forced trimesh/rtree
+        to rebuild its acceleration tree (~3.4s on 285k faces) on every
+        hover move. This cached instance is read-only for queries, so the
+        index builds once and later picks hit it.
+        """
+        if self._ray_mesh is None:
+            self._ray_mesh = trimesh.Trimesh(
+                vertices=self.vertices.copy(),
+                faces=self.faces.copy(),
+                process=False,
+            )
+        return self._ray_mesh
+
     def face_colour(self, face_id: int) -> Color:
         return self.face_colours.get(int(face_id), self.default_colour)
 
     def set_face_colour(self, face_id: int, colour: Color) -> None:
         self.face_colours[int(face_id)] = clamp_color(colour)
 
+    def face_colour_array(self) -> np.ndarray:
+        """All face colours as ``(F, 4)`` float32 in ``0..1`` (vectorized).
+
+        Avoids the per-face Python loop that made renderer init take
+        seconds on 285k-face STEP imports.
+        """
+        count = self.face_count
+        base = np.tile(
+            np.asarray(self.default_colour, dtype=np.float32) / 255.0,
+            (count, 1),
+        )
+        if self.face_colours:
+            ids = np.fromiter(
+                (int(k) for k in self.face_colours.keys()),
+                dtype=np.int64,
+                count=len(self.face_colours),
+            )
+            valid = (ids >= 0) & (ids < count)
+            ids = ids[valid]
+            if len(ids):
+                cols = np.asarray(
+                    [self.face_colours[int(i)] for i in ids.tolist()],
+                    dtype=np.float32,
+                ) / 255.0
+                base[ids] = cols
+        return base.astype(np.float32)
+
     def expanded_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         positions = self.vertices[self.faces].reshape(-1, 3).astype(np.float32)
         normals = np.repeat(self.normals, 3, axis=0).astype(np.float32)
-        colours = np.vstack(
-            [
-                np.tile(
-                    np.array(self.face_colour(face_id), dtype=np.float32) / 255.0,
-                    (3, 1),
-                )
-                for face_id in range(self.face_count)
-            ]
-        ).astype(np.float32)
+        colours = np.repeat(self.face_colour_array(), 3, axis=0).astype(np.float32)
         return positions, normals, colours
 
     def adjacency_map(self) -> dict[int, set[int]]:
         if self._adjacency is not None:
             return self._adjacency
-        mesh = self.mesh()
-        adjacency: dict[int, set[int]] = {
-            face_id: set() for face_id in range(self.face_count)
-        }
-        for left, right in mesh.face_adjacency:
-            adjacency[int(left)].add(int(right))
-            adjacency[int(right)].add(int(left))
+        try:
+            unique, occurrence_faces, inverse = self._build_edge_table()
+            counts = np.bincount(inverse, minlength=len(unique))
+            order = np.argsort(inverse, kind="stable")
+            sorted_faces = occurrence_faces[order]
+            starts = np.zeros(len(unique), dtype=np.int64)
+            starts[1:] = np.cumsum(counts[:-1])
+            pair_rows = np.flatnonzero(counts == 2)
+            lefts = sorted_faces[starts[pair_rows]].astype(np.int64)
+            rights = sorted_faces[starts[pair_rows] + 1].astype(np.int64)
+            keep = lefts != rights
+            lefts = lefts[keep]
+            rights = rights[keep]
+            adjacency: dict[int, set[int]] = {}
+            # Build neighbour lists vectorized, then convert to sets once.
+            all_ids = np.concatenate([lefts, rights])
+            all_nbrs = np.concatenate([rights, lefts])
+            sort_idx = np.argsort(all_ids, kind="stable")
+            sorted_ids = all_ids[sort_idx]
+            sorted_nbrs = all_nbrs[sort_idx]
+            bounds = np.flatnonzero(
+                np.diff(sorted_ids, prepend=-1, append=-2)
+            )
+            adjacency = {face_id: set() for face_id in range(self.face_count)}
+            for start, end in zip(bounds[:-1].tolist(), bounds[1:].tolist()):
+                adjacency[int(sorted_ids[start])] = {
+                    int(v) for v in sorted_nbrs[start:end].tolist()
+                }
+            self._adjacency = adjacency
+            return adjacency
+        except Exception:
+            mesh = self.mesh()
+            adjacency = {
+                face_id: set() for face_id in range(self.face_count)
+            }
+            for left, right in mesh.face_adjacency:
+                adjacency[int(left)].add(int(right))
+                adjacency[int(right)].add(int(left))
         self._adjacency = adjacency
         return adjacency
 
@@ -514,7 +684,39 @@ class MeshModel:
     ) -> dict[str, list[int]]:
         adjacency = self.adjacency_map()
         max_angle = np.deg2rad(float(max(0.0, min(180.0, angle_tolerance_degrees))))
-        visited: set[int] = set()
+        # Fast path: 180° tolerance merges whole connected components, so
+        # skip the per-edge arccos entirely (STL load hits this on 100k+
+        # faces where the trig loop alone costs seconds).
+        if max_angle >= np.pi - 1e-9:
+            from collections import deque
+
+            visited: set[int] = set()
+            groups: dict[str, list[int]] = {}
+            face_to_group: dict[int, str] = {}
+            group_index = 0
+            for start_face in range(self.face_count):
+                if start_face in visited:
+                    continue
+                group_id = f"group_{group_index}"
+                group_index += 1
+                queue = deque([start_face])
+                visited.add(start_face)
+                members: list[int] = []
+                while queue:
+                    face_id = queue.popleft()
+                    members.append(face_id)
+                    for neighbour in adjacency.get(face_id, ()):
+                        if neighbour not in visited:
+                            visited.add(neighbour)
+                            queue.append(neighbour)
+                members.sort()
+                groups[group_id] = members
+                for face_id in members:
+                    face_to_group[face_id] = group_id
+            self.face_groups = groups
+            self.face_to_group = face_to_group
+            return groups
+        visited = set()
         groups: dict[str, list[int]] = {}
         face_to_group: dict[int, str] = {}
         group_index = 0
@@ -720,13 +922,13 @@ class MeshModel:
             ],
             "masked_faces": sorted(self.masked_faces),
             "interaction_mode": self.interaction_mode,
-            "face_groups": {
-                group_id: list(faces) for group_id, faces in self.face_groups.items()
-            },
-            "face_to_group": {
-                str(face_id): group_id
-                for face_id, group_id in self.face_to_group.items()
-            },
+            # Shared references (not copies): grouping is static while
+            # painting — compute_face_groups() reassigns rather than
+            # mutating in place — so snapshots stay valid while skipping
+            # a ~150ms 285k-entry dict copy per stroke. from_project_dict
+            # and save_tg3d only read these.
+            "face_groups": self.face_groups,
+            "face_to_group": self.face_to_group,
             "model_scale": self.model_scale,
         }
 

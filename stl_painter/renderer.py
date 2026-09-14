@@ -173,14 +173,7 @@ class MeshRenderer:
             )
             normals = np.repeat(self.mesh_model.normals, 3, axis=0).astype("f4")
             colours = np.repeat(
-                np.array(
-                    [
-                        self.mesh_model.face_colour(face_id)
-                        for face_id in range(self.mesh_model.face_count)
-                    ],
-                    dtype=np.float32,
-                )
-                / 255.0,
+                self.mesh_model.face_colour_array(),
                 3,
                 axis=0,
             ).astype("f4")
@@ -297,43 +290,23 @@ class MeshRenderer:
         """
         if not self.mesh_model.has_cad_faces:
             return np.zeros((0, 3), dtype=np.float32)
-        edges = self.mesh_model.cad_boundary_edges()
+        edges, _ = self.mesh_model.cad_boundary_with_faces()
         if len(edges) == 0:
             return np.zeros((0, 3), dtype=np.float32)
         mask = self._front_facing_mask(camera)
-        faces = self.mesh_model.faces
-        edge_to_faces: dict[tuple[int, int], list[int]] = {}
-        for face_id in range(len(faces)):
-            a, b, c = (
-                int(faces[face_id, 0]),
-                int(faces[face_id, 1]),
-                int(faces[face_id, 2]),
-            )
-            for u, v in ((a, b), (b, c), (c, a)):
-                key = (u, v) if u < v else (v, u)
-                entry = edge_to_faces.get(key)
-                if entry is None:
-                    edge_to_faces[key] = [face_id]
-                else:
-                    entry.append(face_id)
-        edge_list = edges.tolist()
-        visible = np.array(
-            [
-                bool(
-                    mask[
-                        edge_to_faces.get(
-                            tuple(e) if e[0] < e[1] else (e[1], e[0]), []
-                        )
-                    ].any()
-                )
-                for e in edge_list
-            ],
-            dtype=bool,
-        )
-        if not visible.any():
+        # Vectorized visibility: an edge shows when any incident triangle
+        # fronts the camera. The incident matrix is built once at import,
+        # so the per-frame cost is a single mask lookup, not a 285k-face
+        # dict rebuild (previously ~2.5s per orbit/zoom step).
+        padded = self.mesh_model.cad_boundary_incident_padded()
+        if padded.shape[0] != len(edges) or padded.shape[0] == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        clipped = np.clip(padded, 0, len(mask) - 1)
+        visible = ((mask[clipped]) & (padded >= 0)).any(axis=1)
+        if not bool(visible.any()):
             return np.zeros((0, 3), dtype=np.float32)
         return self.mesh_model.vertices[
-            np.asarray(edge_list, dtype=np.int32)[visible]
+            np.asarray(edges, dtype=np.int32)[visible]
         ].reshape(-1, 3).astype(np.float32)
 
     def _front_cad_edge_vao_for_camera(
@@ -464,6 +437,24 @@ class MeshRenderer:
             if self._gpu_ready:
                 self._create_framebuffers()
 
+    def _write_colour_rows(self, start_row: int, end_row: int) -> None:
+        """Write one contiguous span of colour vertices to the GPU.
+
+        Each interleaved vertex is 10 float32s (3 pos + 3 normal + 4
+        colour); only the colour span is uploaded instead of the whole
+        ~34MB buffer, so painting 1 face on a 285k-face mesh uploads
+        kilobytes, not megabytes.
+        """
+        assert self._colour_vertices is not None
+        assert self._mesh_vbo is not None
+        row_bytes = int(self._colour_vertices.strides[0])
+        chunk = np.ascontiguousarray(self._colour_vertices[start_row:end_row])
+        try:
+            self._mesh_vbo.write(chunk.tobytes(), offset=start_row * row_bytes)
+        except TypeError:
+            # Older moderngl without offset support: fall back to full write.
+            self._mesh_vbo.write(self._colour_vertices.tobytes())
+
     def update_face_colour(self, face_id: int) -> None:
         self._last_render_key = None
         self._last_pick_image = None
@@ -476,10 +467,10 @@ class MeshRenderer:
         base_colour = (
             np.array(self.mesh_model.face_colour(face_id), dtype=np.float32) / 255.0
         )
-        start = face_id * 3
+        start = int(face_id) * 3
         end = start + 3
         self._colour_vertices[start:end, 6:10] = base_colour
-        self._mesh_vbo.write(self._colour_vertices.tobytes())
+        self._write_colour_rows(start, end)
 
     def update_face_colours(
         self, face_ids: list[int] | tuple[int, ...] | set[int]
@@ -494,14 +485,24 @@ class MeshRenderer:
             or self._mesh_vbo is None
         ):
             return
-        for face_id in face_ids:
-            base_colour = (
-                np.array(self.mesh_model.face_colour(face_id), dtype=np.float32) / 255.0
-            )
+        unique = sorted({int(v) for v in face_ids})
+        colours = self.mesh_model.face_colour_array()
+        for face_id in unique:
             start = face_id * 3
             end = start + 3
-            self._colour_vertices[start:end, 6:10] = base_colour
-        self._mesh_vbo.write(self._colour_vertices.tobytes())
+            self._colour_vertices[start:end, 6:10] = colours[face_id]
+        # Batch contiguous faces into single writes (a whole-CAD-face
+        # paint is usually scattered, but brush strokes cluster).
+        run_start = unique[0] * 3
+        prev = unique[0]
+        for face_id in unique[1:]:
+            if face_id == prev + 1:
+                prev = face_id
+                continue
+            self._write_colour_rows(run_start, (prev + 1) * 3)
+            run_start = face_id * 3
+            prev = face_id
+        self._write_colour_rows(run_start, (prev + 1) * 3)
 
     def _camera_key(self, camera: OrbitCamera) -> tuple[tuple[int, int], bytes]:
         return self.viewport_size, camera.mvp_matrix(self.viewport_size).astype(
@@ -601,6 +602,62 @@ class MeshRenderer:
             return self._last_pick_image
         return self._build_pick_image_software(camera)
 
+    def warm_pick_cache(self, camera: OrbitCamera) -> None:
+        """Render the GPU pick buffer for this camera pose if stale.
+
+        Must run on the main loop thread (same GL-safety rule as
+        ``_process_pending_paint``): it binds the pick framebuffer, which
+        access-violates from Dear PyGui frame callbacks on some drivers.
+        Steady-state cost is one ~4ms render per camera move; hover and
+        drag picks then sample the cache in sub-millisecond time.
+        """
+        if not self._gpu_ready:
+            return
+        try:
+            current_key = self._camera_key(camera)
+            if (
+                self._last_pick_image is not None
+                and self._last_render_key == current_key
+            ):
+                return
+            self._render_pick_gpu(camera)
+            assert self._pick_fbo is not None
+            width, height = self.viewport_size
+            pick_image = np.frombuffer(
+                self._pick_fbo.read(components=3, alignment=1), dtype=np.uint8
+            ).reshape((height, width, 3))
+            self._last_pick_image = np.flipud(pick_image).copy()
+            self._last_render_key = current_key
+        except Exception:
+            logger.debug("Pick cache warm failed", exc_info=True)
+
+    def cached_pick_face(
+        self, camera: OrbitCamera, mouse_x: int, mouse_y: int
+    ) -> int | None:
+        """Sample the cached pick buffer without any GL calls.
+
+        Safe from Dear PyGui frame callbacks (hover highlighting).
+        Returns None when the cache is stale so callers can fall back
+        to the CPU raycaster.
+        """
+        if not self._gpu_ready or self._last_pick_image is None:
+            return None
+        try:
+            if self._last_render_key != self._camera_key(camera):
+                return None
+            width, height = self.viewport_size
+            if not 0 <= mouse_x < width and 0 <= mouse_y < height:
+                return None
+            r, g, b = (int(v) for v in self._last_pick_image[mouse_y, mouse_x])
+            face_id = (r << 16) | (g << 8) | b
+            if face_id == 0 and bool(np.all(self._last_pick_image[mouse_y, mouse_x] == 0)):
+                return None
+            if face_id >= self.mesh_model.face_count:
+                return None
+            return face_id
+        except Exception:
+            return None
+
     def pick_face(self, camera: OrbitCamera, mouse_x: int, mouse_y: int) -> int | None:
         """Pick a face at a viewport pixel.
 
@@ -615,14 +672,33 @@ class MeshRenderer:
         if mouse_x >= width or mouse_y >= height:
             return None
         if self._gpu_ready:
-            self._render_pick_gpu(camera)
-            assert self._pick_fbo is not None
-            read_y = height - 1 - mouse_y
-            pixel = self._pick_fbo.read(
-                viewport=(mouse_x, read_y, 1, 1), components=3, alignment=1
-            )
-            r, g, b = pixel[0], pixel[1], pixel[2]
-            face_id = (int(r) << 16) | (int(g) << 8) | int(b)
+            # Cache the pick buffer per camera pose: painting issues many
+            # picks without moving the camera (clicks, drag dabs, hover),
+            # and re-rendering 285k triangles per pick cost ~134ms. First
+            # pick per pose renders once; later picks sample the cache.
+            current_key = self._camera_key(camera)
+            if (
+                self._last_pick_image is None
+                or self._last_render_key != current_key
+            ):
+                self._render_pick_gpu(camera)
+                assert self._pick_fbo is not None
+                pick_image = np.frombuffer(
+                    self._pick_fbo.read(components=3, alignment=1), dtype=np.uint8
+                ).reshape((height, width, 3))
+                self._last_pick_image = np.flipud(pick_image).copy()
+                self._last_render_key = current_key
+            assert self._last_pick_image is not None
+            r, g, b = (int(v) for v in self._last_pick_image[mouse_y, mouse_x])
+            face_id = (r << 16) | (g << 8) | b
+            if face_id == 0:
+                sample = self._last_pick_image[mouse_y, mouse_x]
+                if bool(np.all(sample == 0)):
+                    return (
+                        0
+                        if self._point_hits_face_zero(camera, mouse_x, mouse_y)
+                        else None
+                    )
             if face_id >= self.mesh_model.face_count:
                 return None
             return face_id

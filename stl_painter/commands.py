@@ -198,7 +198,11 @@ class AppCommands:
     def _sync_timeline_snapshots(self) -> None:
         self._timeline_snapshots = []
         if self.mesh_model is not None:
-            self._timeline_snapshots.append(self.mesh_model.to_project_dict())
+            # Lightweight delta: to_project_dict() serializes every vertex,
+            # face and normal (~500ms + tens of MB on 285k-face STEP
+            # imports) per stroke. Deltas carry the same paint/mask state
+            # and save_tg3d() already accepts delta snapshots.
+            self._timeline_snapshots.append(self.mesh_model.to_project_delta())
 
     def _record_snapshot(self) -> None:
         if self.mesh_model is None:
@@ -206,7 +210,7 @@ class AppCommands:
         next_index = self.history.current_index() + 1
         if next_index < len(self._timeline_snapshots):
             self._timeline_snapshots = self._timeline_snapshots[:next_index]
-        self._timeline_snapshots.append(self.mesh_model.to_project_dict())
+        self._timeline_snapshots.append(self.mesh_model.to_project_delta())
 
     def paint_faces(self, updates: dict[int, Color], description: str = "Paint faces") -> list[int]:
         if self.mesh_model is None:

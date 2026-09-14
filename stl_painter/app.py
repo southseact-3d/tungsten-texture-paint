@@ -34,7 +34,13 @@ from .mesh_model import MeshModel
 from . import nav_cube
 from .paint_tool import PaintTool
 from .picking import PickResult, pick_face_location_cpu
-from .project_io import PROJECT_EXTENSION, load_project, load_tg3d, save_tg3d
+from .project_io import (
+    PROJECT_EXTENSION,
+    load_project,
+    load_tg3d,
+    reconstruct_current_model,
+    save_tg3d,
+)
 from .renderer import (
     MeshRenderer,
     RenderSnapshot,
@@ -128,7 +134,13 @@ class TexturePainterApp:
         )
         self._last_brush_face: int | None = None
         self._vis_pick_key: object = None
-        self._vis_pick_image: np.ndarray | None = None
+        self._vis_pick_image = None
+        self._click_pick_key: object = None
+        self._click_pick_image: np.ndarray | None = None
+        # Deferred paint request from Dear PyGui mouse callbacks:
+        # (mouse_pos, is_drag). Resolved in the main loop where GPU
+        # calls are safe (see _process_pending_paint).
+        self._pending_paint_click: tuple[tuple[float, float], bool] | None = None
         self._timeline_context_index: int = 0
         self._pending_dialog: str | None = None
         self._last_hover_px: tuple[int, int] | None = None
@@ -503,6 +515,17 @@ class TexturePainterApp:
             with dpg.theme_component(dpg.mvText, tag="hint_text_theme"):
                 dpg.add_theme_color(dpg.mvThemeCol_Text, (107, 114, 128, 255))
         dpg.bind_theme("light_app_theme")
+        with dpg.theme(tag="colour_swatch_theme"):
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 4)
+                dpg.add_theme_color(dpg.mvThemeCol_Button, self.state.active_colour)
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_ButtonHovered, self.state.active_colour
+                )
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_ButtonActive, self.state.active_colour
+                )
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255, 255))
 
     def _load_default_font(self) -> None:
         font_candidates = [
@@ -542,13 +565,14 @@ class TexturePainterApp:
                 tag="active_colour_hex_label",
                 color=(72, 86, 110),
             )
-            dpg.add_color_button(
-                default_value=list(self.state.active_colour),
+            dpg.add_button(
+                label="",
                 width=-1,
-                height=36,
+                height=40,
                 tag="active_colour_preview",
                 callback=lambda *_: self._open_colour_popup(),
             )
+            dpg.bind_item_theme("active_colour_preview", "colour_swatch_theme")
             dpg.add_text(
                 "Click the swatch to change colour.",
                 color=(107, 114, 128),
@@ -751,6 +775,7 @@ class TexturePainterApp:
             width=440,
             height=560,
             no_collapse=True,
+            popup=True,
         ):
             dpg.add_text("Active Colour", color=(17, 24, 39))
             dpg.add_text(
@@ -761,14 +786,28 @@ class TexturePainterApp:
             dpg.add_text("Palette", color=(17, 24, 39))
             with dpg.group(horizontal=True, tag="colour_popup_palette"):
                 for index, colour in enumerate(PALETTE):
-                    dpg.add_color_button(
-                        default_value=list(colour),
-                        width=40,
+                    palette_theme_tag = f"colour_popup_palette_theme_{index}"
+                    with dpg.theme(tag=palette_theme_tag):
+                        with dpg.theme_component(dpg.mvButton):
+                            dpg.add_theme_color(dpg.mvThemeCol_Button, colour)
+                            dpg.add_theme_color(
+                                dpg.mvThemeCol_ButtonHovered, colour
+                            )
+                            dpg.add_theme_color(
+                                dpg.mvThemeCol_ButtonActive, colour
+                            )
+                            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2, 2)
+                    dpg.add_button(
+                        label="",
+                        width=44,
                         height=30,
                         tag=f"colour_popup_palette_{index}",
                         callback=lambda _s, _a, _u=None, user_data=index: (
                             self._select_palette_colour(user_data)
                         ),
+                    )
+                    dpg.bind_item_theme(
+                        f"colour_popup_palette_{index}", palette_theme_tag
                     )
             dpg.add_color_picker(
                 label="Active Color",
@@ -825,7 +864,15 @@ class TexturePainterApp:
     def _sync_active_colour_ui(self) -> None:
         active = self.state.active_colour
         if dpg.does_item_exist("active_colour_preview"):
-            dpg.set_value("active_colour_preview", list(active))
+            if dpg.does_item_exist("colour_swatch_theme"):
+                dpg.set_value(
+                    "colour_swatch_theme",
+                    {
+                        dpg.mvThemeCol_Button: active,
+                        dpg.mvThemeCol_ButtonHovered: active,
+                        dpg.mvThemeCol_ButtonActive: active,
+                    },
+                )
         if dpg.does_item_exist("active_colour_picker"):
             dpg.set_value("active_colour_picker", list(active))
         if dpg.does_item_exist("active_colour_hex_label"):
@@ -1001,6 +1048,7 @@ class TexturePainterApp:
         self.state.hovered_face = None
         self._sync_workspace_ui()
         self._mark_viewport_dirty()
+        logger.info("WORKSPACE_MODE | mode=%s", mode)
         self._set_status(
             "Texture paint mode enabled" if mode == "paint" else "Preview mode enabled"
         )
@@ -1407,6 +1455,8 @@ class TexturePainterApp:
         self.mesh_model = mesh_model
         self._vis_pick_key = None
         self._vis_pick_image = None
+        self._click_pick_key = None
+        self._click_pick_image = None
         if not mesh_model.face_groups:
             mesh_model.compute_face_groups()
         group_count = len(mesh_model.face_groups)
@@ -1433,6 +1483,13 @@ class TexturePainterApp:
             )
         info_lines.append(f"Masked: {len(mesh_model.masked_faces)}")
         info_lines.append(f"Scale: {mesh_model.model_scale:.4f}x")
+        renderer_mode = (
+            "GPU"
+            if self.renderer is not None
+            and bool(getattr(self.renderer, "_gpu_ready", False))
+            else "Software"
+        )
+        info_lines.append(f"Renderer: {renderer_mode}")
         dpg.set_value("mesh_info_text", "\n".join(info_lines))
         dpg.set_value("model_scale_factor", 1.0)
         dpg.set_value("face_groups_count_text", f"Groups: {group_count}")
@@ -2007,6 +2064,7 @@ class TexturePainterApp:
         except Exception:
             logger.debug("Hover pick failed", exc_info=True)
             face_id = None
+        logger.info("HOVER_PICK | pixel=%s face=%s", pixel, face_id)
         if face_id != self.state.hovered_face:
             self.state.hovered_face = face_id
             self._mark_viewport_dirty()
@@ -2161,13 +2219,152 @@ class TexturePainterApp:
         if self.mesh_model is None:
             return None
         x, y, size = self._to_render_coords(mouse_pos)
-        return pick_face_location_cpu(
+        result = pick_face_location_cpu(
             self.mesh_model,
             self.camera,
             x,
             y,
             size,
         )
+        logger.info(
+            "PICK_RESULT | mouse=%s render=%s,%s size=%s face=%s",
+            mouse_pos,
+            x,
+            y,
+            size,
+            result.face_id if result is not None else None,
+        )
+        return result
+
+    def _pick_result_software(self, mouse_pos: tuple[float, float]) -> PickResult | None:
+        """Accurate pick for paint clicks using the software pick image.
+
+        The CPU raycaster can disagree with the GPU rasterizer on coplanar
+        or edge-on triangles, causing clicks to paint a hidden face while
+        the user sees no change. The software pick image uses the same
+        painter's-algorithm rasterization as the viewport, so it agrees
+        with what the user sees. The image is cached per camera pose so
+        repeated clicks stay responsive on dense meshes.
+        """
+        if self.mesh_model is None or self.renderer is None:
+            return None
+        x, y, size = self._to_render_coords(mouse_pos)
+        px, py = int(x), int(y)
+        if px < 0 or py < 0 or px >= size[0] or py >= size[1]:
+            return None
+        try:
+            cache_key = None
+            try:
+                cache_key = (
+                    self.renderer._camera_key(self.camera),
+                    int(self.mesh_model.face_count),
+                    tuple(size),
+                )
+            except Exception:
+                cache_key = None
+            pick_image = None
+            if (
+                cache_key is not None
+                and getattr(self, "_click_pick_key", None) == cache_key
+                and getattr(self, "_click_pick_image", None) is not None
+            ):
+                pick_image = self._click_pick_image
+            else:
+                pick_image = self.renderer._build_pick_image_software(
+                    self.camera, size
+                )
+                if cache_key is not None:
+                    self._click_pick_key = cache_key
+                    self._click_pick_image = pick_image
+        except Exception:
+            logger.debug("Software pick failed", exc_info=True)
+            return None
+        if py >= pick_image.shape[0] or px >= pick_image.shape[1]:
+            return None
+        r_val, g_val, b_val = (int(v) for v in pick_image[py, px])
+        face_id = (r_val << 16) | (g_val << 8) | b_val
+        if face_id >= self.mesh_model.face_count:
+            return None
+        if face_id == 0 and (r_val, g_val, b_val) == (0, 0, 0):
+            # Encoded black is ambiguous between background and face 0.
+            # Resolve it the same way the renderer does, falling back to
+            # the CPU picker when the render sizes differ.
+            try:
+                if tuple(size) == tuple(self.renderer.viewport_size):
+                    if not self.renderer._point_hits_face_zero(
+                        self.camera, px, py
+                    ):
+                        return None
+                else:
+                    return self._pick_result(mouse_pos)
+            except Exception:
+                pass
+        location = self.mesh_model.face_center(face_id).astype(np.float32)
+        distance = float(np.linalg.norm(location - self.camera.position()))
+        logger.info(
+            "PICK_RESULT_SOFTWARE | mouse=%s render=%s,%s size=%s face=%s",
+            mouse_pos,
+            px,
+            py,
+            size,
+            face_id,
+        )
+        return PickResult(face_id=face_id, location=location, distance=distance)
+
+    def _process_pending_paint(self) -> None:
+        """Apply a queued paint click/drag in the main loop (GL-safe).
+
+        Must run outside Dear PyGui frame callbacks: it resolves the
+        clicked face with the GPU pick buffer — the same rasterizer and
+        depth test as the viewport render, so the painted face is always
+        the displayed one — and binding that framebuffer mid-frame
+        access-violates on some drivers. Falls back to the software pick
+        image, then the CPU raycaster, so a pick failure can never lose
+        a stroke outright.
+        """
+        pending = self._pending_paint_click
+        self._pending_paint_click = None
+        if pending is None:
+            return
+        mouse_pos, is_drag = pending
+        if (
+            self.mesh_model is None
+            or self.renderer is None
+            or self.state.workspace_mode != "paint"
+            or self.state.interaction_mode != "paint"
+            or self.state.paint_tool in {"select"}
+        ):
+            return
+        x, y, size = self._to_render_coords(mouse_pos)
+        face_id: int | None = None
+        try:
+            face_id = self.renderer.pick_face(self.camera, int(x), int(y))
+        except Exception:
+            logger.debug("Display pick failed; falling back", exc_info=True)
+            face_id = None
+        pick: PickResult | None = None
+        if face_id is not None:
+            location = self.mesh_model.face_center(face_id).astype(np.float32)
+            distance = float(np.linalg.norm(location - self.camera.position()))
+            pick = PickResult(face_id=face_id, location=location, distance=distance)
+            logger.info(
+                "PAINT_CLICK | mouse=%s pick=%s (display)", mouse_pos, face_id
+            )
+        else:
+            pick = self._pick_result_software(mouse_pos)
+            if pick is None:
+                pick = self._pick_result(mouse_pos)
+            logger.info(
+                "PAINT_CLICK | mouse=%s pick=%s (fallback)",
+                mouse_pos,
+                pick.face_id if pick else None,
+            )
+        if pick is None:
+            return
+        if is_drag and pick.face_id == self._last_brush_face:
+            return
+        self._apply_paint_at_pick(pick)
+        self._last_brush_face = pick.face_id
 
     def _apply_updates(self, touched: list[int]) -> None:
         if self.renderer is not None and touched:
@@ -2177,19 +2374,30 @@ class TexturePainterApp:
 
     def _apply_paint_at_pick(self, pick: PickResult) -> None:
         if self.mesh_model is None or self.paint_tool is None:
+            logger.info("APPLY_PAINTA_PICK | early exit mesh=%s pt=%s", self.mesh_model is not None, self.paint_tool is not None)
+            return
+        face_id = int(pick.face_id)
+        logger.info("APPLY_PAINTA_PICK | face=%s faces=%s tool=%s", face_id, self.mesh_model.face_count, self.state.paint_tool)
+        if not 0 <= face_id < self.mesh_model.face_count:
+            logger.warning(
+                "Paint click ignored | face=%s out of range (faces=%s)",
+                pick.face_id,
+                self.mesh_model.face_count,
+            )
+            self._set_status("Pick missed the model — no face under the cursor")
             return
         tool = self.state.paint_tool
         if tool == "sample":
-            self.state.active_colour = self.mesh_model.face_colour(pick.face_id)
+            self.state.active_colour = self.mesh_model.face_colour(face_id)
             self._sync_active_colour_ui()
-            self._set_status(f"Sampled face {pick.face_id}")
+            self._set_status(f"Sampled face {face_id}")
             return
         if tool == "mask":
             updated = set(self.mesh_model.masked_faces)
-            if pick.face_id in updated:
-                updated.remove(pick.face_id)
+            if face_id in updated:
+                updated.remove(face_id)
             else:
-                updated.add(pick.face_id)
+                updated.add(face_id)
             touched = self.commands.set_masked_faces(
                 updated, description="Toggle face mask"
             )
@@ -2200,9 +2408,14 @@ class TexturePainterApp:
         if self.mesh_model.has_cad_faces and tool in ("brush", "erase", "fill"):
             # STEP models paint whole CAD faces so colour boundaries follow
             # the CAD shape (rectangles/circles), never triangulation.
-            cad_id = self.mesh_model.cad_id_for_face(pick.face_id)
+            cad_id = self.mesh_model.cad_id_for_face(face_id)
             if cad_id is None:
-                self._set_status("No change — face already has this colour")
+                logger.warning(
+                    "Paint click ignored | face=%s has no CAD group (faces=%s)",
+                    face_id,
+                    self.mesh_model.face_count,
+                )
+                self._set_status("Face has no CAD group — cannot paint it")
                 return
             group_colour = (
                 self.state.active_colour
@@ -2210,14 +2423,23 @@ class TexturePainterApp:
                 else self.mesh_model.default_colour
             )
             updates = {
-                face_id: group_colour
-                for face_id in self.mesh_model.faces_for_cad(cad_id)
-                if face_id not in self.mesh_model.masked_faces
+                member_id: group_colour
+                for member_id in self.mesh_model.faces_for_cad(cad_id)
+                if member_id not in self.mesh_model.masked_faces
             }
+            if not updates:
+                logger.info(
+                    "Paint click | tool=%s face=%s cad=%s all masked",
+                    tool,
+                    face_id,
+                    cad_id,
+                )
+                self._set_status("Face is masked — unmask or Clear Mask to paint it")
+                return
             cad_painted = True
         elif tool == "fill":
             updates = self.paint_tool.flood_fill_updates(
-                pick.face_id,
+                face_id,
                 self.state.active_colour,
                 tolerance=self.state.fill_tolerance,
             )
@@ -2231,7 +2453,7 @@ class TexturePainterApp:
                 self.state.brush.radius * max(1.0, self.mesh_model.mesh_diagonal()),
             )
             updates = self.paint_tool.brush_updates(
-                pick.face_id,
+                face_id,
                 pick.location,
                 self.state.active_colour,
                 radius=radius,
@@ -2247,7 +2469,7 @@ class TexturePainterApp:
             and self.mesh_model is not None
             and updates
         ):
-            group_id = self.mesh_model.group_for_face(pick.face_id)
+            group_id = self.mesh_model.group_for_face(face_id)
             if group_id is not None:
                 grouped_faces = self.mesh_model.faces_for_group(group_id)
                 group_colour = (
@@ -2255,26 +2477,30 @@ class TexturePainterApp:
                     if tool != "erase"
                     else self.mesh_model.default_colour
                 )
-                for face_id in grouped_faces:
-                    if face_id not in self.mesh_model.masked_faces:
-                        updates[face_id] = group_colour
+                for member_id in grouped_faces:
+                    if member_id not in self.mesh_model.masked_faces:
+                        updates[member_id] = group_colour
         touched = self.commands.paint_faces(
             updates, description=f"{tool.title()} stroke"
         )
         logger.info(
-            "Paint click | tool=%s face=%s candidates=%s touched=%s",
+            "Paint click | tool=%s face=%s candidates=%s touched=%s active=%s",
             tool,
-            pick.face_id,
+            face_id,
             len(updates),
             len(touched),
+            self.state.active_colour,
         )
         if not touched:
-            if pick.face_id in self.mesh_model.masked_faces:
+            logger.info("PAINT_CLICK_EMPTY | face=%s masked=%s", face_id, face_id in self.mesh_model.masked_faces)
+            if face_id in self.mesh_model.masked_faces:
                 self._set_status("Face is masked — unmask or Clear Mask to paint it")
             else:
                 self._set_status("No change — face already has this colour")
             return
+        logger.info("PAINT_CLICK_APPLY | face=%s touched=%s", face_id, len(touched))
         self._apply_updates(touched)
+        self._set_status(f"Painted {len(touched)} face(s)")
 
     def _start_sketch_plane(self, face_id: int) -> None:
         if self.mesh_model is None:
@@ -2345,6 +2571,14 @@ class TexturePainterApp:
 
     def _on_mouse_down(self, _sender: int, app_data: tuple[int, float]) -> None:
         button = app_data[0] if isinstance(app_data, (tuple, list)) else int(app_data)
+        logger.info(
+            "MOUSE_DOWN | button=%s viewport=%s paint_mode=%s interaction=%s tool=%s",
+            button,
+            self._mouse_inside_viewport(),
+            self.state.workspace_mode,
+            self.state.interaction_mode,
+            self.state.paint_tool,
+        )
         if self._nav_pad_hovered() and button == 0:
             nav_pos = self._nav_pad_mouse_position()
             if nav_pos is not None:
@@ -2375,10 +2609,11 @@ class TexturePainterApp:
                 self.state.marquee_end = mouse_pos
                 self._mark_viewport_dirty()
             else:
-                pick = self._pick_result(mouse_pos)
-                if pick is not None:
-                    self._apply_paint_at_pick(pick)
-                    self._last_brush_face = pick.face_id
+                # Queue for the main loop: picking must match the displayed
+                # pixels (GPU pick buffer), which is only safe to touch
+                # outside Dear PyGui frame callbacks (see
+                # _process_pending_paint).
+                self._pending_paint_click = (mouse_pos, False)
             return
         if self._active_document() is None:
             pick = self._pick_result(mouse_pos)
@@ -2615,10 +2850,9 @@ class TexturePainterApp:
             and self.state.interaction_mode == "paint"
             and self.state.paint_tool in {"brush", "erase"}
         ):
-            pick = self._pick_result(mouse_pos)
-            if pick is not None and pick.face_id != self._last_brush_face:
-                self._apply_paint_at_pick(pick)
-                self._last_brush_face = pick.face_id
+            # Queue for the main loop (see _process_pending_paint); the
+            # latest position wins so strokes stay smooth at frame rate.
+            self._pending_paint_click = (mouse_pos, True)
         elif (
             self.state.workspace_mode == "paint"
             and self.state.interaction_mode == "paint"
@@ -2681,7 +2915,11 @@ class TexturePainterApp:
         try:
             suffix = Path(path).suffix.lower()
             if suffix == PROJECT_EXTENSION:
-                mesh_model, _timeline = load_tg3d(path)
+                base_model, file_timeline = load_tg3d(path)
+                # The stored model block carries no face colours (paint
+                # lives in the timeline snapshots), so reconstruct the
+                # saved current state instead of the bare base model.
+                mesh_model = reconstruct_current_model(base_model, file_timeline)
                 self._push_recent_project(path)
             elif suffix == ".json":
                 mesh_model = load_project(path)
@@ -2970,6 +3208,7 @@ class TexturePainterApp:
                 if spin and self.mesh_model is not None:
                     self.camera.orbit_pixels(2.0, 1.0, 960.0, 720.0)
                     self._mark_viewport_dirty()
+                self._process_pending_paint()
                 self._render_viewport()
                 dpg.render_dearpygui_frame()
                 frames += 1

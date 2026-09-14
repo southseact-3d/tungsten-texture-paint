@@ -19,7 +19,7 @@ from .commands import AppCommands
 from .importer import load_model
 from .mesh_model import MeshModel
 from .paint_tool import PaintTool
-from .project_io import load_tg3d, save_tg3d
+from .project_io import load_tg3d, reconstruct_current_model, save_tg3d
 from .sketch_tool import SketchTool
 
 
@@ -43,9 +43,11 @@ class CLISession:
         if p.suffix.lower() == ".tg3d":
             base_model, timeline = load_tg3d(p)
             self._timeline = timeline
-            # save() stores all face colours directly in the model block, so
-            # base_model already has the correct current colours.
-            self.mesh_model = base_model
+            # GUI-saved files keep paint in the timeline snapshots with a
+            # colourless base model; CLI-saved files carry colours in the
+            # model block with an empty timeline. Reconstructing covers
+            # both (empty timeline falls back to the base model).
+            self.mesh_model = reconstruct_current_model(base_model, timeline)
         else:
             self.mesh_model = load_model(p)
             self._timeline = None

@@ -8,6 +8,7 @@ from stl_painter.project_io import (
     PROJECT_EXTENSION,
     load_project,
     load_tg3d,
+    reconstruct_current_model,
     save_project,
     save_tg3d,
 )
@@ -143,3 +144,85 @@ def test_project_with_interaction_mode(tmp_path, square_mesh) -> None:
     loaded = load_project(path)
 
     assert loaded.interaction_mode == "sketch"
+
+
+def test_tg3d_reload_restores_painted_colours(tmp_path, square_mesh) -> None:
+    """GUI save/load round trip must preserve painted face colours.
+
+    ``save_tg3d`` strips colours from the stored model block, so opening
+    the bare base model would silently drop every painted colour. The
+    loader must reconstruct the saved current state from the timeline.
+    Mirrors the app open path (``load_tg3d`` + ``reconstruct_current_model``).
+    """
+    from stl_painter.commands import AppCommands
+    from stl_painter.paint_tool import PaintTool
+
+    commands = AppCommands(None, None)
+    commands.attach(square_mesh, PaintTool(square_mesh))
+    touched = commands.paint_faces(
+        {0: (255, 0, 0, 255)}, description="Brush stroke"
+    )
+    assert touched == [0]
+
+    path = tmp_path / f"painted{PROJECT_EXTENSION}"
+    save_tg3d(path, square_mesh, timeline=commands.export_timeline())
+
+    base_model, timeline = load_tg3d(path)
+    # The stored base model carries no colours by design.
+    assert len(base_model.face_colours) == 0
+
+    restored = reconstruct_current_model(base_model, timeline)
+    assert restored.face_colour(0) == (255, 0, 0, 255)
+    assert restored.face_colour(1) == square_mesh.default_colour
+
+
+def test_reconstruct_current_model_fallbacks(square_mesh) -> None:
+    from stl_painter.project_io import reconstruct_current_model
+
+    assert reconstruct_current_model(square_mesh, None) is square_mesh
+    assert reconstruct_current_model(square_mesh, {}) is square_mesh
+    assert (
+        reconstruct_current_model(square_mesh, {"snapshots": []}) is square_mesh
+    )
+    # Out-of-range index clamps instead of raising.
+    timeline = {
+        "current_index": 99,
+        "descriptions": ["Initial state"],
+        "snapshots": [square_mesh.to_project_dict()],
+    }
+    restored = reconstruct_current_model(square_mesh, timeline)
+    assert restored.face_count == square_mesh.face_count
+    # Unreadable snapshot falls back to the base model.
+    bad_timeline = {
+        "current_index": 0,
+        "descriptions": ["Initial state"],
+        "snapshots": [{"not": "a model"}],
+    }
+    assert reconstruct_current_model(square_mesh, bad_timeline) is square_mesh
+
+
+def test_tg3d_round_trip_single_dominant_colour(tmp_path, square_mesh) -> None:
+    """A single shared paint colour must survive save/load.
+
+    The saver must not drop a dominant colour: with every painted face
+    sharing one colour, omitting it would revert the whole paint job to
+    the default grey on reload.
+    """
+    from stl_painter.commands import AppCommands
+    from stl_painter.paint_tool import PaintTool
+
+    commands = AppCommands(None, None)
+    commands.attach(square_mesh, PaintTool(square_mesh))
+    touched = commands.paint_faces(
+        {0: (255, 0, 0, 255), 1: (255, 0, 0, 255)},
+        description="Brush stroke",
+    )
+    assert sorted(touched) == [0, 1]
+
+    path = tmp_path / f"dominant{PROJECT_EXTENSION}"
+    save_tg3d(path, square_mesh, timeline=commands.export_timeline())
+
+    base_model, timeline = load_tg3d(path)
+    restored = reconstruct_current_model(base_model, timeline)
+    assert restored.face_colour(0) == (255, 0, 0, 255)
+    assert restored.face_colour(1) == (255, 0, 0, 255)

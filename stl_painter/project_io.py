@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from pathlib import Path
 
 from .mesh_model import MeshModel, PROJECT_VERSION
@@ -116,22 +115,20 @@ def save_tg3d(
     raw_snapshots = timeline_data.get("snapshots", [])
     deltas: list[dict[str, object]] = []
     prev_snapshot: dict[str, object] | None = None
-    color_counts = Counter(mesh_model.face_colours.values())
-    exclude_colors: set[tuple[int, int, int, int]] = set()
-    if color_counts:
-        common_color, count = color_counts.most_common(1)[0]
-        if count > len(mesh_model.face_colours) * 0.5:
-            exclude_colors = {common_color}
+    # NOTE: every painted colour must be stored. A previous revision
+    # omitted the most common painted colour here to shrink files, but
+    # that value was never recorded anywhere, so those faces silently
+    # reverted to the default colour on load.
     for idx, snapshot in enumerate(raw_snapshots):
         if isinstance(snapshot, dict) and "vertices" in snapshot:
             snapshot_model = MeshModel.from_project_dict(
                 migrate_project_payload(snapshot)
             )
             if idx == 0:
-                delta = _snapshot_to_delta(None, snapshot_model, exclude_colors)
+                delta = _snapshot_to_delta(None, snapshot_model, None)
             else:
                 delta = _snapshot_to_delta(
-                    prev_snapshot, snapshot_model, exclude_colors
+                    prev_snapshot, snapshot_model, None
                 )
         elif isinstance(snapshot, dict):
             delta = snapshot
@@ -175,3 +172,35 @@ def load_tg3d(path: str | Path) -> tuple[MeshModel, dict[str, object]]:
         reconstructed_snapshots.append(current_model.to_project_dict())
     timeline["snapshots"] = reconstructed_snapshots
     return base_model, timeline
+
+
+def reconstruct_current_model(
+    base_model: MeshModel, timeline: dict[str, object] | None
+) -> MeshModel:
+    """Rebuild the saved current model state from a loaded .tg3d timeline.
+
+    ``save_tg3d`` strips ``face_colours`` from the stored model block and
+    keeps paint in the timeline snapshots, so opening the bare base model
+    would silently drop every painted colour. Returns the snapshot at
+    ``current_index`` (clamped into range), falling back to ``base_model``
+    when the timeline is missing, empty, or unreadable.
+    """
+    if not timeline:
+        return base_model
+    snapshots = timeline.get("snapshots", [])
+    if not isinstance(snapshots, list) or not snapshots:
+        return base_model
+    try:
+        current_index = int(timeline.get("current_index", len(snapshots) - 1))
+    except (TypeError, ValueError):
+        current_index = len(snapshots) - 1
+    current_index = max(0, min(current_index, len(snapshots) - 1))
+    snapshot = snapshots[current_index]
+    if not isinstance(snapshot, dict) or "vertices" not in snapshot:
+        return base_model
+    try:
+        return MeshModel.from_project_dict(
+            migrate_project_payload(dict(snapshot))
+        )
+    except Exception:
+        return base_model

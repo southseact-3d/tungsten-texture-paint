@@ -81,7 +81,9 @@ def pick_face_location_cpu(
 ) -> PickResult | None:
     global _CPU_PICK_WARNING_EMITTED
     origin, direction = camera.unproject_ray(mouse_x, mouse_y, viewport_size)
-    mesh = mesh_model.mesh()
+    # Shared cached mesh: mesh() copies per call, forcing trimesh/rtree to
+    # rebuild its spatial index (~3.4s on 285k faces) on every hover move.
+    mesh = mesh_model.mesh_for_ray()
     try:
         locations, _, face_ids = mesh.ray.intersects_location(
             ray_origins=np.asarray([origin], dtype=np.float32),

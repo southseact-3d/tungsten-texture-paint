@@ -1869,6 +1869,31 @@ class TexturePainterApp:
         y = int((1.0 - (ndc[1] * 0.5 + 0.5)) * height)
         return x, y
 
+    def _project_world_batch_to_screen(
+        self, points: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Project many world points at once (vectorized hover outlines).
+
+        Returns ``(pixels, valid)`` with ``pixels`` shaped ``(N, 2)`` int
+        and a bool validity mask. One ``mvp`` multiply for all points
+        instead of thousands of per-vertex Python calls.
+        """
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        if len(pts) == 0:
+            return np.zeros((0, 2), dtype=np.int32), np.zeros((0,), dtype=bool)
+        mvp = self.camera.mvp_matrix(self.state.viewport_size)
+        ones = np.ones((len(pts), 1), dtype=np.float32)
+        clip = (mvp @ np.hstack([pts, ones]).T).T
+        w = clip[:, 3:4]
+        safe = np.where(np.abs(w) < 1e-6, 1e-6, w)
+        ndc = clip[:, :3] / safe
+        valid = np.isfinite(ndc).all(axis=1) & (np.abs(w[:, 0]) >= 1e-6)
+        width, height = self.state.viewport_size
+        pixels = np.empty((len(pts), 2), dtype=np.int32)
+        pixels[:, 0] = ((ndc[:, 0] * 0.5 + 0.5) * width).astype(np.int32)
+        pixels[:, 1] = ((1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height).astype(np.int32)
+        return pixels, valid
+
     def _draw_line(
         self,
         rgba: np.ndarray,
@@ -2055,12 +2080,24 @@ class TexturePainterApp:
         self._last_hover_time = now
         face_id: int | None = None
         try:
-            # CPU picking only: issuing the GPU pick-FBO render from the
-            # Dear PyGui frame thread access-violates on some drivers
-            # (observed on AMD Radeon) and kills the app with no traceback,
-            # so hover highlighting must never call renderer.pick_face here.
-            pick = self._pick_result((float(pixel[0]), float(pixel[1])))
-            face_id = pick.face_id if pick is not None else None
+            # Fast path: sample the GPU pick cache warmed by the main loop
+            # (no GL calls, so safe on the Dear PyGui frame thread).
+            # Falls back to the CPU raycaster when the cache is stale
+            # (camera just moved and the next frame has not warmed it yet).
+            # Direct GPU renders here are forbidden: binding the pick
+            # framebuffer mid-frame access-violates on some drivers
+            # (observed on AMD Radeon), so never call renderer.pick_face
+            # or warm_pick_cache from this handler.
+            if self.renderer is not None:
+                x, y, _ = self._to_render_coords(
+                    (float(pixel[0]), float(pixel[1]))
+                )
+                face_id = self.renderer.cached_pick_face(
+                    self.camera, int(x), int(y)
+                )
+            if face_id is None:
+                pick = self._pick_result((float(pixel[0]), float(pixel[1])))
+                face_id = pick.face_id if pick is not None else None
         except Exception:
             logger.debug("Hover pick failed", exc_info=True)
             face_id = None
@@ -2097,12 +2134,19 @@ class TexturePainterApp:
         if cad_id is None:
             return
         edges = self.mesh_model.cad_face_boundary_edges(cad_id)
-        vertices = self.mesh_model.vertices
-        for u, v in edges[:4000].tolist():
-            p0 = self._project_world_to_screen(vertices[int(u)])
-            p1 = self._project_world_to_screen(vertices[int(v)])
-            if p0 is None or p1 is None:
+        if len(edges) == 0:
+            return
+        edges = edges[:4000]
+        pairs = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+        points = self.mesh_model.vertices[pairs.reshape(-1)]
+        pixels, valid = self._project_world_batch_to_screen(points)
+        pixels = pixels.reshape(-1, 2, 2)
+        valid = valid.reshape(-1, 2)
+        for index in range(len(pairs)):
+            if not bool(valid[index].all()):
                 continue
+            p0 = (int(pixels[index, 0, 0]), int(pixels[index, 0, 1]))
+            p1 = (int(pixels[index, 1, 0]), int(pixels[index, 1, 1]))
             self._draw_line(rgba, p0, p1, (0.2, 0.95, 0.95), alpha=0.95)
 
     def _overlay_selected_faces(self, rgba: np.ndarray) -> None:
@@ -2144,6 +2188,21 @@ class TexturePainterApp:
         self._position_nav_widget()
         self._draw_nav_pad()
         self.state.viewport_dirty = False
+        # Refresh the GPU pick cache for paint-mode hover/drag sampling.
+        # This runs on the main loop thread (GL-safe, same as
+        # _process_pending_paint); the Dear PyGui hover handler only
+        # samples the cache via cached_pick_face().
+        if (
+            self.mesh_model is not None
+            and self.renderer is not None
+            and self.state.workspace_mode == "paint"
+            and self.state.interaction_mode == "paint"
+            and bool(getattr(self.renderer, "_gpu_ready", False))
+        ):
+            try:
+                self.renderer.warm_pick_cache(self.camera)
+            except Exception:
+                logger.debug("Pick cache warm skipped", exc_info=True)
 
     def _mouse_inside_viewport(self) -> bool:
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)

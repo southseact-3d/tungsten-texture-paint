@@ -31,6 +31,7 @@ from .importer import load_model
 from .interaction_state import InteractionState
 from .logging_utils import log_file_path
 from .mesh_model import MeshModel
+from . import navcube as navcube_widget
 from .paint_tool import PaintTool
 from .picking import PickResult, pick_face_location_cpu
 from .project_io import (
@@ -140,6 +141,10 @@ class TexturePainterApp:
         # (mouse_pos, is_drag). Resolved in the main loop where GPU
         # calls are safe (see _process_pending_paint).
         self._pending_paint_click: tuple[tuple[float, float], bool] | None = None
+        # NavCube orbit-gizmo drag state (SlateWallTexturer parity):
+        # {"press_pos": (x, y) render-space, "press_azimuth": float,
+        #  "dragging": bool} or None when no cube gesture is active.
+        self._navcube_drag: dict | None = None
         self._timeline_context_index: int = 0
         self._pending_dialog: str | None = None
         self._last_hover_px: tuple[int, int] | None = None
@@ -1055,6 +1060,7 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
 
     def _draw_world_grid(self, rgba: np.ndarray) -> None:
+        width, _ = self.state.viewport_size
         if self.mesh_model is not None:
             mins = self.mesh_model.vertices.min(axis=0)
             maxs = self.mesh_model.vertices.max(axis=0)
@@ -1950,6 +1956,9 @@ class TexturePainterApp:
             self._overlay_masked_faces(rgba)
             self._overlay_selected_faces(rgba)
             self._overlay_hovered_face(rgba)
+        # Orbit-gizmo cube (SlateWallTexturer parity): always drawn so the
+        # orientation reference is visible even with no model loaded.
+        navcube_widget.draw_navcube(rgba, self.camera.azimuth, self.camera.elevation)
         self._texture_data[:, :, :] = rgba
         if self._viewport_texture_tag is not None:
             dpg.set_value(self._viewport_texture_tag, self._texture_data)
@@ -1969,6 +1978,41 @@ class TexturePainterApp:
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
         image_x, image_y = dpg.get_item_rect_min("viewport_image")
         return mouse_x - image_x, mouse_y - image_y
+
+    def _press_in_navcube(self, mouse_pos: tuple[float, float]) -> bool:
+        """True when a display-space press lands on the NavCube gizmo.
+
+        Maps into render space (same mapping as picking) because the cube
+        is composited into the render-size RGBA buffer.
+        """
+        render_x, render_y, render_size = self._to_render_coords(mouse_pos)
+        return navcube_widget.point_in_navcube(
+            render_x, render_y, render_size[0], render_size[1]
+        )
+
+    def _update_navcube_drag(self, mouse_pos: tuple[float, float]) -> bool:
+        """Advance an active NavCube drag; True when the event is consumed.
+
+        Mirrors SlateWallTexturer ``NavCube.mouseMoveEvent``: a 3px
+        Manhattan press-drag threshold engages the gesture, then horizontal
+        motion orbits azimuth at 0.4 deg/px with a fixed press anchor.
+        Elevation, distance and target are preserved. Release without a
+        drag does nothing (no click-to-snap).
+        """
+        gesture = self._navcube_drag
+        if gesture is None:
+            return False
+        render_x, render_y, _ = self._to_render_coords(mouse_pos)
+        current = (render_x, render_y)
+        if not gesture["dragging"]:
+            if not navcube_widget.drag_engaged(gesture["press_pos"], current):
+                return True
+            gesture["dragging"] = True
+        self.camera.azimuth = navcube_widget.azimuth_for_drag(
+            gesture["press_azimuth"], gesture["press_pos"][0], render_x
+        )
+        self._mark_viewport_dirty()
+        return True
 
     def _pick_viewport_size(self) -> tuple[int, int]:
         """Render-space size matching mouse coordinates.
@@ -2392,6 +2436,20 @@ class TexturePainterApp:
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
+        if button == 0 and self._press_in_navcube(mouse_pos):
+            # NavCube orbit-gizmo gesture (SlateWallTexturer parity): takes
+            # precedence over paint/marquee/orbit; drag orbits the camera.
+            render_x, render_y, _ = self._to_render_coords(mouse_pos)
+            self._navcube_drag = {
+                "press_pos": (render_x, render_y),
+                "press_azimuth": float(self.camera.azimuth),
+                "dragging": False,
+            }
+            self.state.dragging = True
+            self.state.drag_button = button
+            self.state.drag_origin_screen = mouse_pos
+            self.state.drag_engaged = False
+            return
         self.state.dragging = True
         self.state.drag_button = button
         self.state.drag_origin_screen = mouse_pos
@@ -2462,6 +2520,17 @@ class TexturePainterApp:
     ) -> None:
         button = app_data[0] if isinstance(app_data, (tuple, list)) else int(app_data)
         if not self.state.dragging:
+            return
+        if self._navcube_drag is not None:
+            # End of a NavCube gesture: release without drag does nothing
+            # (no click-to-snap); a drag has already orbited the camera.
+            self._navcube_drag = None
+            self.state.dragging = False
+            self.state.drag_button = None
+            self.state.drag_origin_screen = None
+            self.state.drag_origin_plane = None
+            self.state.active_handle = None
+            self.state.drag_engaged = False
             return
         mouse_pos = self._viewport_mouse_position()
         if (
@@ -2579,6 +2648,8 @@ class TexturePainterApp:
                 self._update_hover_face(self._viewport_mouse_position())
             return
         mouse_pos = self._viewport_mouse_position()
+        if self._update_navcube_drag(mouse_pos):
+            return
         dx = mouse_pos[0] - self.state.drag_origin_screen[0]
         dy = mouse_pos[1] - self.state.drag_origin_screen[1]
         width, height = self._pick_viewport_size()

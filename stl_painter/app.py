@@ -1723,8 +1723,8 @@ class TexturePainterApp:
 
         Paint mode outlines triangles so the mesh visibly changes when
         entering texture-paint mode. The outlines are occlusion-correct:
-        the GPU path draws front-facing edges only (see
-        ``MeshRenderer._front_edge_vao_for_camera``) and the software path
+        the GPU path draws truly visible (occlusion-tested) edges only
+        (see ``MeshRenderer._visible_cad_edges``) and the software path
         paints back-to-front, so back edges never shine through the model
         like transparency. Kept as a helper so it is unit-testable.
         """

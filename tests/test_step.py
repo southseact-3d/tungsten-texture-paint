@@ -501,3 +501,78 @@ def test_cad_edge_visible_in_pick() -> None:
     assert not renderer._cad_edge_visible_in_pick(
         pick, screen[12], screen[13], edge_to_faces[(12, 13)]
     )
+
+
+def test_visible_cad_edges_hide_occluded_without_gl() -> None:
+    """GPU helper parity: occluded-but-front-facing edges are dropped.
+
+    The back cube's +z faces point at the camera, so the cheap facing
+    filter alone keeps their edges (asserted below): only the pick-based
+    occlusion test in ``_visible_cad_edges`` hides them. Needs no GL
+    context, so it guards the GPU path on headless CI too.
+    """
+    from stl_painter.camera import OrbitCamera
+    from stl_painter.renderer import MeshRenderer
+
+    vertices, faces, tri_to_cad, cad_meta = _two_cubes_in_row_cad()
+    model = MeshModel.from_cad_arrays(vertices, faces, tri_to_cad, cad_meta)
+    renderer = MeshRenderer(None, model, (400, 300), prefer_gpu=False)
+    camera = OrbitCamera(
+        target=np.array([0.5, 0.5, 1.5], dtype=np.float32),
+        distance=8.0,
+        azimuth=0.0,
+        elevation=85.0,
+    )
+    mask = renderer._front_facing_mask(camera)
+    assert bool(mask[14]) and bool(mask[15])
+
+    visible = renderer._visible_cad_edges(camera)
+    keys = {tuple(sorted(edge)) for edge in visible.tolist()}
+    # Front-cube top edge stays; back-cube top edge (occluded) goes.
+    assert (4, 5) in keys
+    assert (12, 13) not in keys
+
+    # The occlusion filter must actually remove something vs facing-only.
+    incidents = renderer._edge_incidents()
+    edges = model.cad_boundary_edges()
+    front_only = sum(
+        1
+        for u, v in edges.tolist()
+        if bool(mask[incidents.get((u, v) if u < v else (v, u), [])].any())
+    )
+    assert len(visible) < front_only
+
+
+def test_front_cad_edge_positions_hide_occluded() -> None:
+    """End of the GPU chain: positions exclude occluded back-cube edges."""
+    from stl_painter.camera import OrbitCamera
+    from stl_painter.renderer import MeshRenderer
+
+    vertices, faces, tri_to_cad, cad_meta = _two_cubes_in_row_cad()
+    model = MeshModel.from_cad_arrays(vertices, faces, tri_to_cad, cad_meta)
+    renderer = MeshRenderer(None, model, (400, 300), prefer_gpu=False)
+    camera = OrbitCamera(
+        target=np.array([0.5, 0.5, 1.5], dtype=np.float32),
+        distance=8.0,
+        azimuth=0.0,
+        elevation=85.0,
+    )
+    positions = renderer._front_cad_edge_positions(camera)
+    assert len(positions) % 2 == 0
+    assert len(positions) > 0
+    # Back-cube corner (0.2, 0.2, 0.8) must not anchor any drawn edge.
+    back_corner = np.asarray([0.2, 0.2, 0.8], dtype=np.float32)
+    assert not any(
+        np.allclose(positions[i], back_corner, atol=1e-6)
+        for i in range(len(positions))
+    )
+
+
+def test_occlusion_size_caps_large_viewports() -> None:
+    """Occlusion pick stays cheap on large viewports."""
+    from stl_painter.renderer import MeshRenderer
+
+    vertices, faces, tri_to_cad, cad_meta = _two_quad_cad()
+    model = MeshModel.from_cad_arrays(vertices, faces, tri_to_cad, cad_meta)
+    renderer = MeshRenderer(None, model, (1920, 1080), prefer_gpu=False)
+    assert renderer._occlusion_size() == (480, 270)

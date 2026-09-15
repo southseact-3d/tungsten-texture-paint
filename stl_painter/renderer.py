@@ -81,6 +81,7 @@ class MeshRenderer:
         self._front_edge_key: bytes | None = None
         self._front_cad_edge_vao: moderngl.VertexArray | None = None
         self._front_cad_edge_key: bytes | None = None
+        self._edge_incidents_cache: dict[tuple[int, int], list[int]] | None = None
         self._pick_vao: moderngl.VertexArray | None = None
         self._colour_fbo: moderngl.Framebuffer | None = None
         self._pick_fbo: moderngl.Framebuffer | None = None
@@ -288,19 +289,32 @@ class MeshRenderer:
             np.float32
         )
 
-    def _front_cad_edge_positions(self, camera: OrbitCamera) -> np.ndarray:
-        """CAD boundary edges filtered to front-facing faces only.
+    def _occlusion_size(self) -> tuple[int, int]:
+        """Low-res size for the CPU pick image used in edge occlusion tests.
 
-        Prevents back-face CAD edges from shining through the opaque
-        mesh in paint mode — mirrors the front-face filtering already
-        used for triangle meshes via ``_front_edge_vao_for_camera``.
+        Visibility is coarse, so the longest side is capped at 480px to
+        keep per-camera-move cost small on large viewports. World-space
+        edge endpoints are projected at this same size before sampling
+        the pick image (mirrors ``_render_size`` capping in software).
         """
-        if not self.mesh_model.has_cad_faces:
-            return np.zeros((0, 3), dtype=np.float32)
-        edges = self.mesh_model.cad_boundary_edges()
-        if len(edges) == 0:
-            return np.zeros((0, 3), dtype=np.float32)
-        mask = self._front_facing_mask(camera)
+        width, height = self.viewport_size
+        longest = max(int(width), int(height), 1)
+        scale = min(1.0, 480.0 / float(longest))
+        return (
+            max(160, int(int(width) * scale)),
+            max(120, int(int(height) * scale)),
+        )
+
+    def _edge_incidents(self) -> dict[tuple[int, int], list[int]]:
+        """Cached map of undirected mesh edge -> incident triangle ids.
+
+        Topology never changes after import (uniform scaling keeps
+        indices), so this is built once and shared by the GPU visible-edge
+        filter and the software CAD-edge pass instead of rebuilding a
+        dict per frame in three places.
+        """
+        if self._edge_incidents_cache is not None:
+            return self._edge_incidents_cache
         faces = self.mesh_model.faces
         edge_to_faces: dict[tuple[int, int], list[int]] = {}
         for face_id in range(len(faces)):
@@ -316,38 +330,158 @@ class MeshRenderer:
                     edge_to_faces[key] = [face_id]
                 else:
                     entry.append(face_id)
-        edge_list = edges.tolist()
-        visible = np.array(
+        self._edge_incidents_cache = edge_to_faces
+        return edge_to_faces
+
+    def _visible_cad_edges(self, camera: OrbitCamera) -> np.ndarray:
+        """CAD boundary edges that are truly visible (not just front-facing).
+
+        A front-facing edge can still sit behind another part of a concave
+        STEP model; drawing it on top looks like X-ray wireframe. Each
+        front-facing candidate is occlusion-tested against a CPU pick image
+        via ``_cad_edge_visible_in_pick`` (the same test the software
+        renderer uses), so only edges whose samples resolve to their own
+        CAD face are kept. Pure CPU/PIL — safe on the Dear PyGui thread.
+        """
+        if not self.mesh_model.has_cad_faces:
+            return np.zeros((0, 2), dtype=np.int32)
+        edges = self.mesh_model.cad_boundary_edges()
+        if len(edges) == 0:
+            return np.zeros((0, 2), dtype=np.int32)
+        mask = self._front_facing_mask(camera)
+        edge_to_faces = self._edge_incidents()
+        edge_list = np.asarray(edges, dtype=np.int32)
+        front = np.array(
             [
-                bool(
-                    mask[
-                        edge_to_faces.get(
-                            tuple(e) if e[0] < e[1] else (e[1], e[0]), []
-                        )
-                    ].any()
-                )
-                for e in edge_list
+                bool(mask[edge_to_faces.get((int(u), int(v)) if int(u) < int(v) else (int(v), int(u)), [])].any())
+                for u, v in edge_list.tolist()
             ],
             dtype=bool,
         )
-        if not visible.any():
+        if not front.any():
+            return np.zeros((0, 2), dtype=np.int32)
+        occ_size = self._occlusion_size()
+        screen, valid = self._project_vertices(camera, occ_size)
+        pick_image = self._build_pick_image_software(camera, occ_size)
+        # Fully vectorized window test across all front-facing candidates:
+        # 5 sample points x 3x3 windows per edge resolve with a handful of
+        # numpy ops (a Python loop here costs ~3s on a 5k-face STEP model).
+        # Integer ``tri_to_cad`` indices stand in for ``cad_id_for_face``
+        # (which sorts the whole ``cad_faces`` dict per call): neighbours
+        # on one CAD plane share the same index, matching the acceptance
+        # rule of ``_cad_edge_visible_in_pick`` used by the software path.
+        tri_cad = self.mesh_model.tri_to_cad
+        tri_cad_ints = (
+            np.asarray(tri_cad, dtype=np.int64).reshape(-1)
+            if tri_cad is not None
+            else None
+        )
+        face_count = int(self.mesh_model.face_count)
+        pick_h, pick_w = int(pick_image.shape[0]), int(pick_image.shape[1])
+        cand_idx = np.flatnonzero(front)
+        if cand_idx.size == 0:
+            return np.zeros((0, 2), dtype=np.int32)
+        cand = edge_list[cand_idx]
+        cand_valid = valid[cand[:, 0]] & valid[cand[:, 1]]
+        # Incident faces per candidate, padded with -1 (STEP boundary
+        # edges almost always have exactly one incident face).
+        members_per_edge = [
+            edge_to_faces.get(
+                (int(u), int(v)) if int(u) < int(v) else (int(v), int(u)), []
+            )
+            for u, v in cand.tolist()
+        ]
+        max_members = max(1, max(len(m) for m in members_per_edge))
+        member_mat = np.full((len(cand), max_members), -1, dtype=np.int64)
+        for i, members in enumerate(members_per_edge):
+            for j, fid in enumerate(members[:max_members]):
+                member_mat[i, j] = int(fid)
+        has_members = (member_mat >= 0).any(axis=1)
+        wanted_mat = np.full((len(cand), max_members), -1, dtype=np.int64)
+        if tri_cad_ints is not None:
+            clipped = np.clip(member_mat, 0, len(tri_cad_ints) - 1)
+            wanted_mat = np.where(
+                member_mat >= 0, tri_cad_ints[clipped], -1
+            )
+        pick_ids = (
+            pick_image[:, :, 0].astype(np.int32) << 16
+            | pick_image[:, :, 1].astype(np.int32) << 8
+            | pick_image[:, :, 2].astype(np.int32)
+        )
+        fractions = np.asarray((0.1, 0.3, 0.5, 0.7, 0.9), dtype=np.float32)
+        p0 = screen[cand[:, 0]].astype(np.float32)
+        delta = screen[cand[:, 1]].astype(np.float32) - p0
+        samples = (
+            p0[:, None, :] + fractions[None, :, None] * delta[:, None, :]
+        )
+        cxs = np.round(samples[:, :, 0]).astype(np.int32)
+        cys = np.round(samples[:, :, 1]).astype(np.int32)
+        offsets = np.asarray(
+            [(dx, dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)],
+            dtype=np.int32,
+        )
+        win_x = cxs[:, :, None] + offsets[None, None, :, 0]
+        win_y = cys[:, :, None] + offsets[None, None, :, 1]
+        win_ok = (
+            (win_x >= 0) & (win_x < pick_w) & (win_y >= 0) & (win_y < pick_h)
+        )
+        safe_x = np.clip(win_x, 0, pick_w - 1)
+        safe_y = np.clip(win_y, 0, pick_h - 1)
+        shown = np.where(win_ok, pick_ids[safe_y, safe_x], -1)
+        member_hit = (
+            (shown[..., None] == member_mat[:, None, None, :])
+            & win_ok[..., None]
+        ).any(axis=(1, 2, 3))
+        in_mesh = (shown >= 0) & (shown < face_count) & win_ok
+        if tri_cad_ints is not None and wanted_mat.shape[1] > 0:
+            safe_shown = np.clip(shown, 0, len(tri_cad_ints) - 1)
+            shown_cad = np.where(in_mesh, tri_cad_ints[safe_shown], -1)
+            cad_hit = (
+                (shown_cad[..., None] == wanted_mat[:, None, None, :])
+                & in_mesh[..., None]
+            ).any(axis=(1, 2, 3))
+        else:
+            cad_hit = np.zeros(len(cand), dtype=bool)
+        edge_visible = (
+            np.asarray(member_hit).reshape(-1)
+            | np.asarray(cad_hit).reshape(-1)
+        ) & np.asarray(cand_valid).reshape(-1) & np.asarray(has_members).reshape(-1)
+        kept = cand[np.flatnonzero(edge_visible)]
+        if len(kept) == 0:
+            return np.zeros((0, 2), dtype=np.int32)
+        return np.asarray(kept, dtype=np.int32)
+
+    def _front_cad_edge_positions(self, camera: OrbitCamera) -> np.ndarray:
+        """CAD boundary edges filtered to truly visible edges only.
+
+        Front-facing filter first (cheap), then a true occlusion test per
+        edge against a pick image: on concave STEP models a front-facing
+        edge can sit behind another part of the mesh, and drawing it on top
+        looks like X-ray wireframe. Same test the software renderer uses.
+        """
+        if not self.mesh_model.has_cad_faces:
             return np.zeros((0, 3), dtype=np.float32)
-        return self.mesh_model.vertices[
-            np.asarray(edge_list, dtype=np.int32)[visible]
-        ].reshape(-1, 3).astype(np.float32)
+        visible = self._visible_cad_edges(camera)
+        if len(visible) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        return self.mesh_model.vertices[visible].reshape(-1, 3).astype(np.float32)
 
     def _front_cad_edge_vao_for_camera(
         self, camera: OrbitCamera
     ) -> moderngl.VertexArray | None:
-        """Cached VAO of front-facing CAD-boundary edges only.
+        """Cached VAO of truly visible CAD-boundary edges only.
 
-        Rebuilt only when the camera position changes, so per-frame cost
-        in paint mode is a single vectorized facing test plus a cache
-        hit. Returns None when no CAD edges are visible.
+        Rebuilt only when the camera position or viewport changes, so
+        per-frame cost in paint mode is one vectorized facing test plus a
+        low-res pick render on cache miss, then a cache hit. Returns None
+        when no CAD edges are visible.
         """
         assert isinstance(self.ctx, moderngl.Context)
         assert self._edge_program is not None
-        key = camera.position().astype("f4").tobytes()
+        key = (
+            camera.position().astype("f4").tobytes()
+            + bytes(bytearray(f"{self.viewport_size}".encode()))
+        )
         if self._front_cad_edge_key != key or self._front_cad_edge_vao is None:
             positions = self._front_cad_edge_positions(camera)
             if len(positions) == 0:
@@ -461,6 +595,12 @@ class MeshRenderer:
             self.viewport_size = viewport_size
             self._last_render_key = None
             self._last_pick_image = None
+            # Visibility decisions now depend on the viewport (occlusion
+            # pick size), so drop cached edge VAOs on resize.
+            self._front_edge_key = None
+            self._front_edge_vao = None
+            self._front_cad_edge_key = None
+            self._front_cad_edge_vao = None
             if self._gpu_ready:
                 self._create_framebuffers()
 
@@ -538,7 +678,15 @@ class MeshRenderer:
         self._colour_fbo.clear(
             float(bg[0]), float(bg[1]), float(bg[2]), float(bg[3]), depth=1.0
         )
-        self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        # STEP tessellation is per-CAD-face with duplicated vertices and
+        # untrusted winding, so backface culling can carve holes in the
+        # outer shell (see-through mesh + leaked edges). Draw both faces
+        # for CAD models; depth testing still resolves nearest-wins.
+        if self.mesh_model.has_cad_faces:
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.CULL_FACE)
+        else:
+            self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
         self._mesh_program["mvp"].write(self._mvp_bytes(camera))
         self._mesh_program["light_dir"].value = tuple(float(v) for v in light_dir)
         self._mesh_vao.render(mode=moderngl.TRIANGLES)
@@ -547,10 +695,12 @@ class MeshRenderer:
             self._edge_program["mvp"].write(self._mvp_bytes(camera))
             self._edge_program["line_colour"].value = (0.0, 0.0, 0.0, 1.0)
             if self.mesh_model.has_cad_faces:
-                # STEP models: CAD-boundary outlines on front-facing faces
-                # only, so back-face edges cannot shine through the mesh.
+                # STEP models: CAD-boundary outlines on truly visible
+                # (occlusion-tested) edges only, so occluded interior edges
+                # cannot shine through the mesh like X-ray wireframe.
                 front_cad_vao = self._front_cad_edge_vao_for_camera(camera)
                 if front_cad_vao is not None:
+                    self.ctx.enable(moderngl.DEPTH_TEST)
                     self.ctx.disable(moderngl.CULL_FACE)
                     self._edge_program["depth_bias"].value = 0.0006
                     front_cad_vao.render(mode=moderngl.LINES)
@@ -561,6 +711,7 @@ class MeshRenderer:
                 # off the surface to avoid z-fighting.
                 front_vao = self._front_edge_vao_for_camera(camera)
                 if front_vao is not None:
+                    self.ctx.enable(moderngl.DEPTH_TEST)
                     self.ctx.disable(moderngl.CULL_FACE)
                     self._edge_program["depth_bias"].value = 0.0006
                     front_vao.render(mode=moderngl.LINES)
@@ -779,49 +930,23 @@ class MeshRenderer:
 
         if show_triangle_edges and self.mesh_model.has_cad_faces:
             # STEP models: outline CAD faces only, never triangulation.
-            # Front-facing filter first (cheap), then a true occlusion
-            # test per edge against a pick image: on concave models a
-            # front-facing edge can sit behind another part of the mesh,
-            # and drawing it on top looks like X-ray wireframe.
-            screen, valid = self._project_vertices(camera, render_size)
-            mask = self._front_facing_mask(camera)
-            faces = self.mesh_model.faces
-            edge_to_faces: dict[tuple[int, int], list[int]] = {}
-            for face_id in range(len(faces)):
-                a, b, c = (
-                    int(faces[face_id, 0]),
-                    int(faces[face_id, 1]),
-                    int(faces[face_id, 2]),
+            # Visibility decisions come from the shared occlusion-tested
+            # helper (front-facing filter + pick-image test, integer fast
+            # path); only the drawing projection uses render_size.
+            visible = self._visible_cad_edges(camera)
+            if len(visible) > 0:
+                draw_screen, draw_valid = self._project_vertices(
+                    camera, render_size
                 )
-                for u, v in ((a, b), (b, c), (c, a)):
-                    key = (u, v) if u < v else (v, u)
-                    entry = edge_to_faces.get(key)
-                    if entry is None:
-                        edge_to_faces[key] = [face_id]
-                    else:
-                        entry.append(face_id)
-            face_zero_front = bool(mask[0]) if len(mask) > 0 else False
-            pick_image = self._build_pick_image_software(camera, render_size)
-            for u, v in self.mesh_model.cad_boundary_edges().tolist():
-                key = (u, v) if u < v else (v, u)
-                members = edge_to_faces.get(key, [])
-                if not members or not mask[members].any():
-                    continue
-                if not (valid[u] and valid[v]):
-                    continue
-                if not self._cad_edge_visible_in_pick(
-                    pick_image,
-                    screen[u],
-                    screen[v],
-                    members,
-                    face_zero_front=face_zero_front,
-                ):
-                    continue
-                draw.line(
-                    [tuple(screen[u]), tuple(screen[v])],
-                    fill=(0, 0, 0, 255),
-                    width=1,
-                )
+                for u, v in visible.tolist():
+                    u, v = int(u), int(v)
+                    if not (bool(draw_valid[u]) and bool(draw_valid[v])):
+                        continue
+                    draw.line(
+                        [tuple(draw_screen[u]), tuple(draw_screen[v])],
+                        fill=(0, 0, 0, 255),
+                        width=1,
+                    )
 
         if render_size != self.viewport_size:
             image = image.resize(self.viewport_size, Image.Resampling.BILINEAR)

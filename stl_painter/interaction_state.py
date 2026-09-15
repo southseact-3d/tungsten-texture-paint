@@ -11,7 +11,6 @@ InteractionMode = Literal["paint", "sketch"]
 PaintMode = Literal["brush", "fill", "sample", "erase", "mask", "select"]
 SketchMode = Literal["select", "line", "rect", "circle", "text"]
 WorkspaceMode = Literal["preview", "paint"]
-NavAxis = Literal["xp", "xn", "yp", "yn", "zp", "zn"]
 
 
 @dataclass(slots=True)
@@ -57,11 +56,6 @@ class InteractionState:
     dragging: bool = False
     drag_button: int | None = None
     drag_engaged: bool = False
-    nav_dragging: bool = False
-    nav_drag_origin: tuple[float, float] | None = None
-    nav_hover_axis: NavAxis | None = None
-    nav_pressed_axis: NavAxis | None = None
-    nav_drag_moved: bool = False
     shift_down: bool = False
     ctrl_down: bool = False
     tab_down: bool = False

@@ -31,7 +31,6 @@ from .importer import load_model
 from .interaction_state import InteractionState
 from .logging_utils import log_file_path
 from .mesh_model import MeshModel
-from . import nav_cube
 from .paint_tool import PaintTool
 from .picking import PickResult, pick_face_location_cpu
 from .project_io import (
@@ -412,21 +411,6 @@ class TexturePainterApp:
                     tag="viewport_panel",
                 ):
                     dpg.add_image(self._viewport_texture_tag, tag="viewport_image")
-                    with dpg.window(
-                        tag="viewport_nav",
-                        label="",
-                        no_title_bar=True,
-                        no_move=True,
-                        no_resize=True,
-                        no_scrollbar=True,
-                        no_collapse=True,
-                        autosize=True,
-                    ):
-                        dpg.add_text("View")
-                        dpg.add_drawlist(width=132, height=132, tag="viewport_nav_pad")
-                        dpg.add_button(
-                            label="Home", width=72, callback=self._reset_view
-                        )
                     with dpg.handler_registry():
                         dpg.add_mouse_down_handler(callback=self._on_mouse_down)
                         dpg.add_mouse_release_handler(callback=self._on_mouse_release)
@@ -1070,173 +1054,7 @@ class TexturePainterApp:
             self.camera = OrbitCamera(np.array([0.0, 0.0, 0.0], dtype=np.float32), 5.0)
         self._mark_viewport_dirty()
 
-    def _position_nav_widget(self) -> None:
-        if not dpg.does_item_exist("viewport_nav") or not dpg.does_item_exist(
-            "viewport_image"
-        ):
-            return
-        image_pos = dpg.get_item_rect_min("viewport_image")
-        image_size = dpg.get_item_rect_size("viewport_image")
-        nav_size = dpg.get_item_rect_size("viewport_nav")
-        if image_size[0] <= 0 or image_size[1] <= 0:
-            return
-        x = int(image_pos[0] + image_size[0] - nav_size[0] - 12)
-        y = int(image_pos[1] + 12)
-        dpg.set_item_pos("viewport_nav", [x, y])
-
-    def _nav_gizmo_geometry(self) -> dict[str, object]:
-        width, height = 132, 132
-        return {
-            "size": (width, height),
-            "center": (width / 2.0, height / 2.0),
-            "radius": 60.0,
-            "orbit_radius": 52.0,
-            "half_size": 36.0,
-        }
-
-    def _nav_cube_faces(self) -> list[dict[str, object]]:
-        gizmo = self._nav_gizmo_geometry()
-        center = gizmo["center"]
-        assert isinstance(center, tuple)
-        return nav_cube.project_cube(
-            self.camera.view_matrix()[:3, :3],
-            (float(center[0]), float(center[1])),
-            float(gizmo["half_size"]),
-        )
-
-    def _draw_nav_pad(self) -> None:
-        if not dpg.does_item_exist("viewport_nav_pad"):
-            return
-        dpg.delete_item("viewport_nav_pad", children_only=True)
-        gizmo = self._nav_gizmo_geometry()
-        center = gizmo["center"]
-        radius = gizmo["radius"]
-        dpg.draw_circle(
-            center,
-            radius,
-            color=(118, 126, 140, 220),
-            fill=(243, 245, 248, 210),
-            thickness=2,
-            parent="viewport_nav_pad",
-        )
-        faces = self._nav_cube_faces()
-        centers = nav_cube.face_centers_2d(faces)
-        for face in faces:
-            axis = str(face["axis"])
-            polygon = [
-                (float(point[0]), float(point[1]))
-                for point in np.asarray(face["polygon"], dtype=np.float32)
-            ]
-            hovered = self.state.nav_hover_axis == axis
-            fill = tuple(face["fill"])  # type: ignore[union-attr]
-            if hovered:
-                fill = tuple(min(255, component + 45) for component in fill[:3]) + (255,)
-            outline = (24, 24, 28, 255) if hovered else (90, 96, 106, 255)
-            dpg.draw_polygon(
-                polygon,
-                color=outline,
-                fill=fill,
-                thickness=2 if hovered else 1,
-                parent="viewport_nav_pad",
-            )
-            label_pos = centers[axis]
-            dpg.draw_text(
-                (label_pos[0] - 4, label_pos[1] - 7),
-                str(face["label"]),
-                color=(255, 255, 255, 255),
-                size=12,
-                parent="viewport_nav_pad",
-            )
-        dpg.draw_text(
-            (28, 112),
-            "Drag to rotate",
-            color=(82, 88, 96, 255),
-            size=13,
-            parent="viewport_nav_pad",
-        )
-
-    def _nav_pad_hovered(self) -> bool:
-        return dpg.does_item_exist("viewport_nav_pad") and bool(
-            dpg.is_item_hovered("viewport_nav_pad")
-        )
-
-    def _nav_pad_mouse_position(self) -> tuple[float, float] | None:
-        if not dpg.does_item_exist("viewport_nav_pad"):
-            return None
-        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-        pad_x, pad_y = dpg.get_item_rect_min("viewport_nav_pad")
-        return mouse_x - pad_x, mouse_y - pad_y
-
-    def _global_mouse_position(self) -> tuple[float, float]:
-        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-        return float(mouse_x), float(mouse_y)
-
-    def _client_to_screen(self, x: float, y: float) -> tuple[float, float]:
-        hwnd = _USER32.GetActiveWindow()
-        if not hwnd:
-            return x, y
-        point = _POINT(int(round(x)), int(round(y)))
-        _USER32.ClientToScreen(hwnd, ctypes.byref(point))
-        return float(point.x), float(point.y)
-
-    def _nav_pad_screen_rect(self) -> tuple[int, int, int, int] | None:
-        if not dpg.does_item_exist("viewport_nav_pad"):
-            return None
-        local_x, local_y = dpg.get_item_rect_min("viewport_nav_pad")
-        width, height = dpg.get_item_rect_size("viewport_nav_pad")
-        screen_x, screen_y = self._client_to_screen(local_x, local_y)
-        inset = 12
-        return (
-            int(round(screen_x + inset)),
-            int(round(screen_y + inset)),
-            int(round(screen_x + width - inset)),
-            int(round(screen_y + height - inset)),
-        )
-
-    def _nav_pad_screen_center(self) -> tuple[float, float] | None:
-        rect = self._nav_pad_screen_rect()
-        if rect is None:
-            return None
-        left, top, right, bottom = rect
-        return (left + right) / 2.0, (top + bottom) / 2.0
-
-    def _clip_nav_cursor(self) -> None:
-        rect = self._nav_pad_screen_rect()
-        if rect is None:
-            return
-        left, top, right, bottom = rect
-        clip = _RECT(left=left, top=top, right=right, bottom=bottom)
-        _USER32.ClipCursor(ctypes.byref(clip))
-
-    def _center_nav_cursor(self) -> tuple[float, float] | None:
-        center = self._nav_pad_screen_center()
-        if center is None:
-            return None
-        x, y = center
-        _USER32.SetCursorPos(int(round(x)), int(round(y)))
-        return center
-
-    def _release_cursor_clip(self) -> None:
-        _USER32.ClipCursor(None)
-
-    def _nav_hit_test(self, mouse_pos: tuple[float, float]) -> tuple[str, str | None]:
-        gizmo = self._nav_gizmo_geometry()
-        center = gizmo["center"]
-        assert isinstance(center, tuple)
-        return nav_cube.hit_test(
-            (float(mouse_pos[0]), float(mouse_pos[1])),
-            self._nav_cube_faces(),
-            float(gizmo["orbit_radius"]),
-            (float(center[0]), float(center[1])),
-        )
-
-    def _snap_camera_to_axis(self, axis: str) -> None:
-        azimuth, elevation = nav_cube.snap_angles(axis)
-        self.camera.set_angles(azimuth, elevation)
-        self._mark_viewport_dirty()
-
     def _draw_world_grid(self, rgba: np.ndarray) -> None:
-        width, _ = self.state.viewport_size
         if self.mesh_model is not None:
             mins = self.mesh_model.vertices.min(axis=0)
             maxs = self.mesh_model.vertices.max(axis=0)
@@ -2036,13 +1854,7 @@ class TexturePainterApp:
             or self.state.workspace_mode != "paint"
             or self.state.interaction_mode != "paint"
             or self.state.dragging
-            or self.state.nav_dragging
         ):
-            if self.state.hovered_face is not None:
-                self.state.hovered_face = None
-                self._mark_viewport_dirty()
-            return
-        if self._nav_pad_hovered():
             if self.state.hovered_face is not None:
                 self.state.hovered_face = None
                 self._mark_viewport_dirty()
@@ -2141,8 +1953,6 @@ class TexturePainterApp:
         self._texture_data[:, :, :] = rgba
         if self._viewport_texture_tag is not None:
             dpg.set_value(self._viewport_texture_tag, self._texture_data)
-        self._position_nav_widget()
-        self._draw_nav_pad()
         self.state.viewport_dirty = False
 
     def _mouse_inside_viewport(self) -> bool:
@@ -2153,7 +1963,7 @@ class TexturePainterApp:
             image_x <= mouse_x < image_x + width
             and image_y <= mouse_y < image_y + height
         )
-        return within or self._nav_pad_hovered()
+        return within
 
     def _viewport_mouse_position(self) -> tuple[float, float]:
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
@@ -2579,19 +2389,6 @@ class TexturePainterApp:
             self.state.interaction_mode,
             self.state.paint_tool,
         )
-        if self._nav_pad_hovered() and button == 0:
-            nav_pos = self._nav_pad_mouse_position()
-            if nav_pos is not None:
-                action, axis = self._nav_hit_test(nav_pos)
-                if action != "none":
-                    self.state.nav_dragging = True
-                    self.state.nav_pressed_axis = axis
-                    self.state.nav_drag_moved = False
-                    self._clip_nav_cursor()
-                    self.state.nav_drag_origin = self._center_nav_cursor()
-                    if self.state.nav_drag_origin is None:
-                        self.state.nav_drag_origin = self._global_mouse_position()
-                    return
         if not self._mouse_inside_viewport():
             return
         mouse_pos = self._viewport_mouse_position()
@@ -2664,19 +2461,6 @@ class TexturePainterApp:
         self, _sender: int, app_data: tuple[int, float] | int
     ) -> None:
         button = app_data[0] if isinstance(app_data, (tuple, list)) else int(app_data)
-        if self.state.nav_dragging:
-            if (
-                button == 0
-                and not self.state.nav_drag_moved
-                and self.state.nav_pressed_axis is not None
-            ):
-                self._snap_camera_to_axis(self.state.nav_pressed_axis)
-            self.state.nav_dragging = False
-            self.state.nav_drag_origin = None
-            self.state.nav_pressed_axis = None
-            self.state.nav_drag_moved = False
-            self._release_cursor_clip()
-            return
         if not self.state.dragging:
             return
         mouse_pos = self._viewport_mouse_position()
@@ -2786,34 +2570,12 @@ class TexturePainterApp:
         self._mark_viewport_dirty()
 
     def _on_mouse_move(self, _sender: int, _app_data: tuple[float, float]) -> None:
-        nav_pos = self._nav_pad_mouse_position() if self._nav_pad_hovered() else None
-        if nav_pos is not None:
-            action, axis = self._nav_hit_test(nav_pos)
-            new_hover_axis = axis if action == "axis" else None
-            if new_hover_axis != self.state.nav_hover_axis:
-                self.state.nav_hover_axis = new_hover_axis
-                self._draw_nav_pad()
-        elif self.state.nav_hover_axis is not None:
-            self.state.nav_hover_axis = None
-            self._draw_nav_pad()
-        if self.state.nav_dragging and self.state.nav_drag_origin is not None:
-            mouse_pos = self._global_mouse_position()
-            dx = mouse_pos[0] - self.state.nav_drag_origin[0]
-            dy = mouse_pos[1] - self.state.nav_drag_origin[1]
-            if dx * dx + dy * dy >= 9.0:
-                self.state.nav_drag_moved = True
-            if self.state.nav_drag_moved:
-                self.camera.orbit_pixels(dx, dy, 132.0, 132.0)
-                new_origin = self._center_nav_cursor()
-                self.state.nav_drag_origin = new_origin or self.state.nav_drag_origin
-                self._mark_viewport_dirty()
-            return
         if (
             not self._mouse_inside_viewport()
             or not self.state.dragging
             or self.state.drag_origin_screen is None
         ):
-            if not self.state.dragging and not self.state.nav_dragging:
+            if not self.state.dragging:
                 self._update_hover_face(self._viewport_mouse_position())
             return
         mouse_pos = self._viewport_mouse_position()
@@ -3216,7 +2978,6 @@ class TexturePainterApp:
                     logger.info("Smoke-test frame budget reached | frames=%s", frames)
                     dpg.stop_dearpygui()
         finally:
-            self._release_cursor_clip()
             dpg.destroy_context()
 
 
